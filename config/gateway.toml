@@ -1,0 +1,50 @@
+# MCP Gateway Configuration
+# ========================
+
+[gateway]
+name = "mcp-gateway"
+listen_addr = "127.0.0.1:8080"
+
+# ── Backend MCP Servers ──
+
+[[backends]]
+name = "weather-tool"
+transport = "streamable-http"
+endpoint = "http://localhost:9001/mcp"
+tools = ["get_weather", "get_forecast"]
+timeout_ms = 30000
+
+[[backends]]
+name = "calculator"
+transport = "streamable-http"
+endpoint = "http://localhost:9002/mcp"
+tools = ["calculate", "sqrt"]
+timeout_ms = 10000
+
+# Example stdio backend (uncomment to use)
+# [[backends]]
+# name = "local-tool"
+# transport = "stdio"
+# command = "npx"
+# args = ["-y", "@anthropic/mcp-calculator"]
+# tools = ["add", "multiply"]
+
+# ── Authentication ──
+
+[auth]
+enabled = false
+# api_keys = ["sk-gateway-key-1", "sk-gateway-key-2"]
+# api_key_header = "x-api-key"
+
+# ── Cache ──
+
+[cache]
+enabled = true
+max_capacity = 10000
+ttl_seconds = 300
+
+# ── Logging ──
+
+[logging]
+level = "info"
+format = "json"
