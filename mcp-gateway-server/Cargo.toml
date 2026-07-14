@@ -1,0 +1,39 @@
+[package]
+name = "mcp-gateway-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "MCP Gateway server - HTTP server, routing, proxy, caching, auth"
+
+[dependencies]
+mcp-gateway-core = { path = "../mcp-gateway-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+# Config
+toml = "1"
+# HTTP server
+axum = "0.8"
+# HTTP client (for backend connections)
+reqwest = { version = "0.13", features = ["json", "stream"] }
+# Middleware
+tower = "0.5"
+# Cache
+moka = { version = "0.12", features = ["future"] }
+# Concurrent data structures
+dashmap = "6"
+# JSON Schema validation
+jsonschema = "0.47"
+# SSE streaming
+tokio-stream = { version = "0.1", features = ["sync"] }
+futures-util = "0.3"

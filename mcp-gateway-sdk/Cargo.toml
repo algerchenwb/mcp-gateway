@@ -1,0 +1,17 @@
+[package]
+name = "mcp-gateway-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Rust client SDK for the MCP Gateway"
+
+[dependencies]
+mcp-gateway-core = { path = "../mcp-gateway-core" }
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+reqwest = { version = "0.13", features = ["json"] }
+uuid.workspace = true
