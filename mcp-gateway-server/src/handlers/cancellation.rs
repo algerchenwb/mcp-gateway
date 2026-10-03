@@ -33,6 +33,13 @@ impl Requests {
             }
         }
     }
+    pub fn cancel_scope(&self, scope: &str) {
+        for request in self.0.iter() {
+            if request.key().0 == scope {
+                request.value().abort();
+            }
+        }
+    }
     pub fn cancel(&self, scope: &str, id: RequestId) {
         if let Some(handle) = self.0.get(&(scope.to_owned(), id)) {
             handle.abort();
