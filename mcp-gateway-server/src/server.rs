@@ -27,7 +27,10 @@ pub struct AppState {
 pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Streamable HTTP — the primary JSON-RPC endpoint
-        .route("/mcp", axum::routing::post(crate::handlers::json_rpc::handle))
+        .route(
+            "/mcp",
+            axum::routing::post(crate::handlers::json_rpc::handle),
+        )
         // SSE transport — persistent connection
         .route("/mcp/sse", axum::routing::get(crate::handlers::sse::handle))
         // SSE message endpoint
@@ -42,7 +45,10 @@ pub fn build_router(state: AppState) -> Router {
         // Middleware layers (applied from bottom to top)
         .layer(middleware::from_fn(logging::logging_layer))
         .layer(middleware::from_fn(metrics::metrics_layer))
-        .layer(middleware::from_fn(auth::auth_layer))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::auth_layer,
+        ))
         .with_state(state)
 }
 
@@ -72,9 +78,7 @@ pub async fn run(config: GatewayConfig) {
         .await
         .expect("Failed to bind to address");
 
-    axum::serve(listener, app)
-        .await
-        .expect("Server error");
+    axum::serve(listener, app).await.expect("Server error");
 }
 
 /// Health check endpoint.
@@ -87,4 +91,74 @@ async fn metrics_handler(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> axum::Json<metrics::MetricsSnapshot> {
     axum::Json(state.metrics.snapshot())
+}
+#[cfg(test)]
+mod security_tests {
+    use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use tower::ServiceExt;
+    fn app() -> Router {
+        let mut config = GatewayConfig::default();
+        config.auth.enabled = true;
+        config.auth.api_keys = vec!["test-secret".into()];
+        config.gateway.allowed_origins = vec!["https://trusted.example".into()];
+        build_router(AppState {
+            config: Arc::new(config),
+            cache: Arc::new(L1Cache::new(10, std::time::Duration::from_secs(10))),
+            metrics: Arc::default(),
+        })
+    }
+    #[tokio::test]
+    async fn every_mcp_entrypoint_requires_authentication() {
+        for (method, path) in [
+            ("POST", "/mcp"),
+            ("GET", "/mcp/sse"),
+            ("POST", "/mcp/sse/unknown"),
+            ("GET", "/metrics"),
+        ] {
+            let response = app()
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{path}");
+        }
+        assert_eq!(
+            app()
+                .oneshot(
+                    Request::builder()
+                        .uri("/health")
+                        .body(Body::empty())
+                        .unwrap()
+                )
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+    }
+    #[tokio::test]
+    async fn origin_is_checked_even_with_valid_key() {
+        let response = app()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/mcp")
+                    .header("origin", "https://evil.example")
+                    .header("x-api-key", "test-secret")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
 }

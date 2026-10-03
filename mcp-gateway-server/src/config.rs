@@ -25,6 +25,9 @@ pub struct GatewaySettings {
     /// Address to listen on (e.g., "127.0.0.1:8080").
     #[serde(default = "default_listen_addr")]
     pub listen_addr: String,
+    /// Browser origins explicitly allowed to access MCP endpoints.
+    #[serde(default)]
+    pub allowed_origins: Vec<String>,
 }
 
 impl Default for GatewaySettings {
@@ -32,6 +35,7 @@ impl Default for GatewaySettings {
         Self {
             name: default_gateway_name(),
             listen_addr: default_listen_addr(),
+            allowed_origins: Vec::new(),
         }
     }
 }
@@ -229,7 +233,65 @@ impl GatewayConfig {
             errors.push("at least one backend must be configured".to_string());
         }
 
+        if self
+            .gateway
+            .listen_addr
+            .parse::<std::net::SocketAddr>()
+            .is_err()
+        {
+            errors.push("gateway.listen_addr must be an IP socket address".into());
+        }
+        if self.auth.enabled && self.auth.api_keys.is_empty() {
+            errors.push("auth.enabled requires at least one API key".into());
+        }
+        if self
+            .auth
+            .api_key_header
+            .parse::<axum::http::HeaderName>()
+            .is_err()
+        {
+            errors.push("auth.api_key_header is invalid".into());
+        }
+        let mut backend_names = std::collections::HashSet::new();
+        let mut tool_names = std::collections::HashSet::new();
         for (i, backend) in self.backends.iter().enumerate() {
+            if backend.name.is_empty() || !backend_names.insert(&backend.name) {
+                errors.push(format!(
+                    "backends[{i}]: backend name must be nonempty and unique"
+                ));
+            }
+            if backend.transport.parse::<TransportType>().is_err()
+                || backend.transport == "websocket"
+            {
+                errors.push(format!(
+                    "backends[{i}]: unsupported transport '{}'",
+                    backend.transport
+                ));
+            }
+            if backend.timeout_ms == 0 || backend.max_connections == 0 {
+                errors.push(format!(
+                    "backends[{i}]: timeout_ms and max_connections must be positive"
+                ));
+            }
+            if let Some(endpoint) = &backend.endpoint {
+                if !reqwest::Url::parse(endpoint).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https")
+                        && url.host_str().is_some()
+                        && url.username().is_empty()
+                        && url.password().is_none()
+                }) {
+                    errors.push(format!(
+                        "backends[{i}]: endpoint must be an HTTP(S) URL without userinfo"
+                    ));
+                }
+            }
+            for tool in &backend.tools {
+                if tool.is_empty() || !tool_names.insert(tool) {
+                    errors.push(format!(
+                        "backends[{i}]: tool names must be nonempty and unique"
+                    ));
+                }
+            }
             match backend.transport_type() {
                 TransportType::Stdio => {
                     if backend.command.is_none() {
@@ -295,5 +357,25 @@ transport = "stdio"
         let config: GatewayConfig = toml::from_str(toml_str).unwrap();
         let result = config.validate();
         assert!(result.is_err());
+    }
+}
+#[cfg(test)]
+mod validation_tests {
+    use super::*;
+    #[test]
+    fn invalid_transport_and_duplicate_names_are_rejected() {
+        let mut config = GatewayConfig::default();
+        config.backends = vec![
+            BackendConfig {
+                name: "same".into(),
+                transport: "typo".into(),
+                endpoint: Some("ftp://example".into()),
+                tools: vec!["echo".into()],
+                ..Default::default()
+            };
+            2
+        ];
+        config.auth.enabled = true;
+        assert!(config.validate().unwrap_err().len() >= 4);
     }
 }

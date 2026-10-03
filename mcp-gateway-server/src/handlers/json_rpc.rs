@@ -4,7 +4,6 @@
 //! clients POST JSON-RPC messages and receive JSON-RPC responses.
 
 use axum::extract::State;
-use axum::http::HeaderMap;
 use axum::Json;
 use serde_json::Value;
 
@@ -22,44 +21,13 @@ use crate::server::AppState;
 /// Handle a JSON-RPC request at POST /mcp.
 pub async fn handle(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Json<Value>> {
-    // Auth check
-    check_auth(&state, &headers)?;
-
     // Parse the incoming JSON-RPC message
     let message: JsonRpcMessage = serde_json::from_value(body)
         .map_err(|e| json_error(RequestId::Null, error_codes::PARSE_ERROR, e.to_string()))?;
 
     process_message(state, message).await
-}
-
-/// Check API key authentication.
-fn check_auth(state: &AppState, headers: &HeaderMap) -> Result<(), Json<Value>> {
-    if !state.config.auth.enabled {
-        return Ok(());
-    }
-
-    // Extract API key from headers
-    let key = headers
-        .get(&state.config.auth.api_key_header)
-        .and_then(|v| v.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("Authorization")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.strip_prefix("Bearer "))
-        });
-
-    match key {
-        Some(k) if state.config.auth.api_keys.iter().any(|valid| valid == k) => Ok(()),
-        _ => Err(json_error(
-            RequestId::Null,
-            error_codes::INTERNAL_ERROR,
-            "authentication required",
-        )),
-    }
 }
 
 /// Core message processing logic, shared across transport handlers.
@@ -296,6 +264,7 @@ mod tests {
                 gateway: GatewaySettings {
                     name: "test".into(),
                     listen_addr: "127.0.0.1:0".into(),
+                    allowed_origins: vec![],
                 },
                 backends: vec![BackendConfig {
                     name: "test-backend".into(),

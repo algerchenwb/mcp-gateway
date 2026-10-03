@@ -6,12 +6,9 @@ use axum::response::Response;
 use std::time::Instant;
 
 /// Logging middleware that records request method, path, latency, and status.
-pub async fn logging_layer(
-    req: Request,
-    next: Next,
-) -> Response {
+pub async fn logging_layer(req: Request, next: Next) -> Response {
     let method = req.method().clone();
-    let uri = req.uri().clone();
+    let path = req.uri().path().to_owned();
     let start = Instant::now();
 
     let response = next.run(req).await;
@@ -21,7 +18,7 @@ pub async fn logging_layer(
 
     tracing::info!(
         method = %method,
-        uri = %uri,
+        path = %path,
         status = status.as_u16(),
         latency_ms = latency.as_millis(),
         "request completed"

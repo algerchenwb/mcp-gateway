@@ -27,7 +27,7 @@ axum = "0.8"
 # HTTP client (for backend connections)
 reqwest = { version = "0.13", features = ["json", "stream"] }
 # Middleware
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 # Cache
 moka = { version = "0.12", features = ["future"] }
 # Concurrent data structures

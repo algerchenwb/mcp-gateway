@@ -1,28 +1,50 @@
-//! Auth middleware — tower Layer for API key authentication.
-//!
-//! Phase 1: simple pass-through. Auth enforcement happens in the JSON-RPC handler
-//! which has access to AppState. The middleware here just logs auth headers.
+//! Shared authentication and Origin validation for all MCP transports.
+use crate::server::AppState;
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 
-use axum::extract::Request;
-use axum::middleware::Next;
-use axum::response::Response;
-
-/// Auth middleware — logs auth headers, enforcement in handler.
-pub async fn auth_layer(
-    req: Request,
-    next: Next,
-) -> Response {
-    // Log auth headers for observability
-    if let Some(auth) = req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            tracing::debug!(auth_header = auth_str, "auth header present");
+pub async fn auth_layer(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    if req.uri().path().starts_with("/mcp") {
+        if let Some(origin) = req.headers().get("origin") {
+            let allowed = origin.to_str().ok().is_some_and(|origin| {
+                state
+                    .config
+                    .gateway
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed == origin)
+            });
+            if !allowed {
+                return StatusCode::FORBIDDEN.into_response();
+            }
         }
     }
-    if let Some(key) = req.headers().get("x-api-key") {
-        if let Ok(key_str) = key.to_str() {
-            tracing::debug!(api_key = key_str, "api key header present");
+    let config = &state.config.auth;
+    if config.enabled {
+        let key = req
+            .headers()
+            .get(&config.api_key_header)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| {
+                req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+            });
+        if !key.is_some_and(|key| config.api_keys.iter().any(|valid| valid == key)) {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [("www-authenticate", "Bearer realm=\"mcp-gateway\"")],
+            )
+                .into_response();
         }
     }
-
     next.run(req).await
 }
