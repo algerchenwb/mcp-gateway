@@ -15,6 +15,7 @@ pub struct AppState {
     pub cache: Arc<L1Cache>,
     pub metrics: Arc<metrics::Metrics>,
     pub backends: Arc<crate::proxy::registry::BackendRegistry>,
+    pub sse: Arc<crate::handlers::sse::SseSessions>,
 }
 
 impl AppState {
@@ -31,6 +32,7 @@ impl AppState {
             cache,
             backends,
             metrics: Arc::default(),
+            sse: Arc::default(),
         }
     }
 }

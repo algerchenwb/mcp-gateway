@@ -153,3 +153,100 @@ async fn gateway_discovers_real_schema_validates_arguments_and_caches_opted_in_t
     gateway.abort();
     backend.abort();
 }
+
+#[tokio::test]
+async fn legacy_sse_executes_calls_and_rejects_another_identity() {
+    let mut config = GatewayConfig::default();
+    config.auth.enabled = true;
+    config.auth.api_keys = vec!["owner".into(), "other".into()];
+    config.backends = vec![stdio_config()];
+    let state = AppState::new(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let root = format!("http://{}", listener.local_addr().unwrap());
+    let app = build_router(state.clone());
+    let task = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let http = reqwest::Client::new();
+    let mut stream = http
+        .get(format!("{root}/mcp/sse"))
+        .header("x-api-key", "owner")
+        .send()
+        .await
+        .unwrap();
+    let mut decoder = mcp_gateway_core::sse::SseDecoder::default();
+    let endpoint = loop {
+        let chunk = stream.chunk().await.unwrap().unwrap();
+        let events = decoder.push(&chunk, 10000).unwrap();
+        if let Some((_, url)) = events.into_iter().find(|(kind, _)| kind == "endpoint") {
+            break url;
+        }
+    };
+    let url = format!("{root}{endpoint}");
+    let request = serde_json::json!({"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"echo","arguments":{"value":"sse works"}}});
+    assert_eq!(
+        http.post(&url)
+            .header("x-api-key", "other")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        http.post(&url)
+            .header("x-api-key", "owner")
+            .json(&request)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::ACCEPTED
+    );
+    let data = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let chunk = stream.chunk().await.unwrap().unwrap();
+            let events = decoder.push(&chunk, 10000).unwrap();
+            if let Some((_, data)) = events.into_iter().find(|(kind, _)| kind == "message") {
+                break data;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    let value: serde_json::Value = serde_json::from_str(&data).unwrap();
+    assert_eq!(value["id"], 12);
+    assert_eq!(value["result"]["content"][0]["text"], "sse works");
+    drop(stream);
+    state.sse.close_all();
+    state.backends.shutdown().await;
+    task.abort();
+}
+#[tokio::test]
+async fn gateway_can_use_legacy_sse_backend() {
+    let mut upstream_config = GatewayConfig::default();
+    upstream_config.backends = vec![stdio_config()];
+    let upstream_state = AppState::new(upstream_config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/mcp/sse", listener.local_addr().unwrap());
+    let app = build_router(upstream_state.clone());
+    let upstream = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let backend = BackendClient::new(Arc::new(BackendConfig {
+        name: "legacy".into(),
+        transport: "sse".into(),
+        endpoint: Some(endpoint),
+        timeout_ms: 3000,
+        ..Default::default()
+    }));
+    let result = backend
+        .request(
+            "tools/call",
+            Some(serde_json::json!({"name":"echo","arguments":{"value":"legacy"}})),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result["content"][0]["text"], "legacy");
+    backend.shutdown().await;
+    upstream_state.sse.close_all();
+    upstream_state.backends.shutdown().await;
+    upstream.abort();
+}

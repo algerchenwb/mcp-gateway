@@ -1,108 +1,160 @@
-//! SSE (Server-Sent Events) transport handler.
-//!
-//! Per the MCP specification, SSE transport works as follows:
-//! 1. Client connects to GET /mcp/sse
-//! 2. Server sends an `endpoint` event with a unique session-specific message URL
-//! 3. Client POSTs JSON-RPC messages to that session URL
-//! 4. Server streams responses back as SSE events
-
-use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
-use axum::response::Sse as SseResponse;
-use futures_util::stream::Stream;
-use std::convert::Infallible;
-use std::time::Duration;
-use tokio::sync::broadcast;
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::BroadcastStream;
-use uuid::Uuid;
-
+//! Legacy HTTP+SSE with bounded queues, authenticated ownership and disconnect cleanup.
 use crate::server::AppState;
-
-/// SSE event types for MCP.
-#[derive(Debug, Clone)]
-pub enum McpSseEvent {
-    /// Sent when the SSE connection is established, containing the message endpoint URL.
-    Endpoint { session_id: String, message_url: String },
-    /// A JSON-RPC response or notification to be sent to the client.
-    Message(String),
-    /// Connection is being closed.
-    Close,
+use axum::{
+    body::Bytes,
+    extract::{Path, State},
+    http::{HeaderMap, StatusCode},
+    response::sse::{Event, KeepAlive, Sse},
+};
+use dashmap::DashMap;
+use futures_util::{Stream, StreamExt};
+use mcp_gateway_core::types::JsonRpcMessage;
+use std::{
+    convert::Infallible,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll},
+    time::{Duration, Instant},
+};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio_stream::wrappers::ReceiverStream;
+struct Session {
+    sender: mpsc::Sender<String>,
+    scope: String,
+    created: Instant,
+    _permit: OwnedSemaphorePermit,
 }
-
-// SSE endpoint handler — establishes a persistent SSE connection.
-// Phase 1: basic SSE with keepalive. Full bidirectional streaming in Phase 2.
-pub async fn handle(
-    State(state): State<AppState>,
-) -> SseResponse<impl Stream<Item = Result<Event, Infallible>>> {
-    let session_id = Uuid::new_v4().to_string();
-    let message_url = format!(
-        "http://{}/mcp/sse/{}",
-        state.config.gateway.listen_addr,
-        session_id
-    );
-
-    tracing::info!(session_id = %session_id, "SSE connection established");
-
-    // Create a channel for sending messages to this SSE client
-    let (_tx, rx) = broadcast::channel::<String>(64);
-
-    // Store the sender for later use by the JSON-RPC handler
-    // Phase 1: sender stored for future use in session registry
-
-    let stream = BroadcastStream::new(rx).filter_map(|result| {
-        match result {
-            Ok(msg) => Some(Ok(Event::default().data(msg).event("message"))),
-            Err(_) => None,
-        }
-    });
-
-    // Send the endpoint event first, then the message stream
-    let endpoint_event = Event::default()
-        .data(message_url)
-        .event("endpoint");
-
-    let initial = tokio_stream::once(Ok::<Event, Infallible>(endpoint_event));
-    let combined = initial.chain(stream);
-
-    Sse::new(combined)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keepalive"),
-        )
+pub struct SseSessions {
+    sessions: DashMap<String, Session>,
+    slots: Arc<Semaphore>,
+    ttl: Duration,
+    queue_capacity: usize,
 }
-
-/// Handle POST /mcp/sse/:session_id — receive JSON-RPC messages for an SSE session.
-pub async fn handle_message(
-    State(_state): State<AppState>,
-    axum::extract::Path(session_id): axum::extract::Path<String>,
-    axum::Json(body): axum::Json<serde_json::Value>,
-) -> axum::Json<serde_json::Value> {
-    tracing::debug!(
-        session_id = %session_id,
-        "received SSE message"
-    );
-
-    // Phase 1: basic acknowledgment
-    // Full SSE message handling will be implemented with the session registry in Phase 2
-    match serde_json::from_value::<mcp_gateway_core::types::JsonRpcMessage>(body) {
-        Ok(msg) => {
-            tracing::debug!(
-                method = ?msg.method(),
-                "SSE message received"
-            );
-            axum::Json(serde_json::json!({"status": "accepted", "session": session_id}))
-        }
-        Err(e) => {
-            axum::Json(serde_json::json!({
-                "jsonrpc": "2.0",
-                "error": {
-                    "code": -32700,
-                    "message": format!("Parse error: {}", e)
-                },
-                "id": null
-            }))
+impl Default for SseSessions {
+    fn default() -> Self {
+        Self {
+            sessions: DashMap::new(),
+            slots: Arc::new(Semaphore::new(1024)),
+            ttl: Duration::from_secs(1800),
+            queue_capacity: 32,
         }
     }
+}
+impl SseSessions {
+    pub fn close_all(&self) {
+        self.slots.close();
+        self.sessions.clear();
+    }
+}
+struct SessionStream {
+    inner: ReceiverStream<String>,
+    sessions: Arc<SseSessions>,
+    id: String,
+}
+impl Stream for SessionStream {
+    type Item = Result<Event, Infallible>;
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.inner)
+            .poll_next(cx)
+            .map(|item| item.map(|data| Ok(Event::default().event("message").data(data))))
+    }
+}
+impl Drop for SessionStream {
+    fn drop(&mut self) {
+        self.sessions.sessions.remove(&self.id);
+    }
+}
+pub async fn handle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
+    let permit = state
+        .sse
+        .slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let scope = super::json_rpc::credential_scope(&state, &headers);
+    let (sender, receiver) = mpsc::channel(state.sse.queue_capacity);
+    state.sse.sessions.insert(
+        id.clone(),
+        Session {
+            sender,
+            scope,
+            created: Instant::now(),
+            _permit: permit,
+        },
+    );
+    let initial = tokio_stream::once(Ok(Event::default()
+        .event("endpoint")
+        .data(format!("/mcp/sse/{id}"))));
+    let stream = SessionStream {
+        inner: ReceiverStream::new(receiver),
+        sessions: state.sse.clone(),
+        id,
+    };
+    let combined = initial
+        .chain(stream)
+        .take_until(tokio::time::sleep(state.sse.ttl));
+    Ok(Sse::new(combined).keep_alive(
+        KeepAlive::new()
+            .interval(Duration::from_secs(15))
+            .text("keepalive"),
+    ))
+}
+pub async fn handle_message(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let scope = super::json_rpc::credential_scope(&state, &headers);
+    let sender = {
+        let Some(session) = state.sse.sessions.get(&id) else {
+            return StatusCode::NOT_FOUND;
+        };
+        if session.scope != scope {
+            return StatusCode::NOT_FOUND;
+        }
+        if session.created.elapsed() >= state.sse.ttl {
+            drop(session);
+            state.sse.sessions.remove(&id);
+            return StatusCode::NOT_FOUND;
+        }
+        session.sender.clone()
+    };
+    if !headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(';').next() == Some("application/json"))
+    {
+        return StatusCode::UNSUPPORTED_MEDIA_TYPE;
+    }
+    let Ok(message) = serde_json::from_slice::<JsonRpcMessage>(&body) else {
+        return StatusCode::BAD_REQUEST;
+    };
+    if matches!(
+        message,
+        JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_)
+    ) {
+        return StatusCode::BAD_REQUEST;
+    }
+    if matches!(message, JsonRpcMessage::Notification(_)) {
+        let _ = super::json_rpc::process_message_scoped(state, message, &scope).await;
+        return StatusCode::ACCEPTED;
+    }
+    // Reserve a bounded response slot before executing the tool, so saturation cannot trigger duplicate writes.
+    let permit = match sender.try_reserve_owned() {
+        Ok(permit) => permit,
+        Err(_) => return StatusCode::TOO_MANY_REQUESTS,
+    };
+    tokio::spawn(async move {
+        let response = super::json_rpc::process_message_scoped(state, message, &scope).await;
+        let value = match response {
+            Ok(value) | Err(value) => value.0,
+        };
+        permit.send(value.to_string());
+    });
+    StatusCode::ACCEPTED
 }
