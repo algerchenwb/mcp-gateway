@@ -21,13 +21,22 @@ use crate::server::AppState;
 /// Handle a JSON-RPC request at POST /mcp.
 pub async fn handle(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<Json<Value>, Json<Value>> {
     // Parse the incoming JSON-RPC message
     let message: JsonRpcMessage = serde_json::from_value(body)
         .map_err(|e| json_error(RequestId::Null, error_codes::PARSE_ERROR, e.to_string()))?;
 
-    process_message(state, message).await
+    use sha2::{Digest, Sha256};
+    let credential = headers
+        .get(&state.config.auth.api_key_header)
+        .or_else(|| headers.get("authorization"));
+    let scope = credential.map_or_else(
+        || "public".to_string(),
+        |value| format!("{:x}", Sha256::digest(value.as_bytes())),
+    );
+    process_message_scoped(state, message, &scope).await
 }
 
 /// Core message processing logic, shared across transport handlers.
@@ -35,9 +44,17 @@ pub async fn process_message(
     state: AppState,
     message: JsonRpcMessage,
 ) -> Result<Json<Value>, Json<Value>> {
+    process_message_scoped(state, message, "public").await
+}
+
+pub async fn process_message_scoped(
+    state: AppState,
+    message: JsonRpcMessage,
+    scope: &str,
+) -> Result<Json<Value>, Json<Value>> {
     match message {
         JsonRpcMessage::Request(req) => {
-            let resp = handle_request(state, req).await;
+            let resp = handle_request(state, req, scope).await;
             let json = serde_json::to_value(&resp).unwrap_or_else(|_| {
                 json_error_value(
                     RequestId::Null,
@@ -60,13 +77,13 @@ pub async fn process_message(
 }
 
 /// Route a JSON-RPC request to the appropriate handler.
-async fn handle_request(state: AppState, req: JsonRpcRequest) -> JsonRpcMessage {
+async fn handle_request(state: AppState, req: JsonRpcRequest, scope: &str) -> JsonRpcMessage {
     let method = req.method.as_str();
 
     match method {
         "initialize" => handle_initialize(req.id, req.params),
         "tools/list" => handle_tools_list(state, req.id),
-        "tools/call" => handle_tools_call(state, req.id, req.params).await,
+        "tools/call" => handle_tools_call(state, req.id, req.params, scope).await,
         "ping" => handle_ping(req.id),
         _ => JsonRpcMessage::Error(JsonRpcErrorResponse::new(
             req.id,
@@ -173,6 +190,7 @@ async fn handle_tools_call(
     state: AppState,
     id: RequestId,
     params: Option<Value>,
+    scope: &str,
 ) -> JsonRpcMessage {
     let params = match params {
         Some(p) => p,
@@ -216,7 +234,7 @@ async fn handle_tools_call(
         None
     };
 
-    match forward::forward_tool_call(&target, tool_name, arguments, cache).await {
+    match forward::forward_tool_call(&target, tool_name, arguments, cache, scope).await {
         Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::new(
             id,
             serde_json::to_value(result).unwrap_or_default(),

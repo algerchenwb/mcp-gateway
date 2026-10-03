@@ -57,8 +57,10 @@ pub async fn run(config: GatewayConfig) {
     let listen_addr = config.gateway.listen_addr.clone();
 
     // Build L1 cache
-    let cache = Arc::new(L1Cache::new(
+    let cache = Arc::new(L1Cache::with_limits(
         config.cache.max_capacity,
+        config.cache.max_bytes,
+        config.cache.max_result_bytes,
         std::time::Duration::from_secs(config.cache.ttl_seconds),
     ));
 

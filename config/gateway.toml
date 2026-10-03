@@ -39,7 +39,10 @@ enabled = false
 # ── Cache ──
 
 [cache]
-enabled = true
+enabled = false
+# Enable only with explicit per-backend cache_tools for read-only tools.
+max_bytes = 67108864
+max_result_bytes = 1048576
 max_capacity = 10000
 ttl_seconds = 300
 

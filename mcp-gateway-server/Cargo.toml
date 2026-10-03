@@ -37,3 +37,4 @@ jsonschema = "0.47"
 # SSE streaming
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+sha2 = "0.10"

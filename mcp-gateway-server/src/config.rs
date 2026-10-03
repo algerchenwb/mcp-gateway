@@ -73,6 +73,9 @@ pub struct BackendConfig {
     /// from this backend are available.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// Explicit allowlist of read-only tools whose successful results may be cached.
+    #[serde(default)]
+    pub cache_tools: Vec<String>,
     /// Request timeout in milliseconds.
     #[serde(default = "default_timeout")]
     pub timeout_ms: u64,
@@ -118,6 +121,7 @@ impl Default for BackendConfig {
             args: Vec::new(),
             env: std::collections::HashMap::new(),
             tools: Vec::new(),
+            cache_tools: Vec::new(),
             timeout_ms: default_timeout(),
             max_connections: default_max_connections(),
             weight: default_weight(),
@@ -165,6 +169,17 @@ pub struct CacheConfig {
     /// Time-to-live in seconds.
     #[serde(default = "default_cache_ttl")]
     pub ttl_seconds: u64,
+    #[serde(default = "default_cache_max_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "default_cache_result_bytes")]
+    pub max_result_bytes: usize,
+}
+
+fn default_cache_max_bytes() -> u64 {
+    64 * 1024 * 1024
+}
+fn default_cache_result_bytes() -> usize {
+    1024 * 1024
 }
 
 fn default_cache_max_capacity() -> u64 {
@@ -181,6 +196,8 @@ impl Default for CacheConfig {
             enabled: true,
             max_capacity: default_cache_max_capacity(),
             ttl_seconds: default_cache_ttl(),
+            max_bytes: default_cache_max_bytes(),
+            max_result_bytes: default_cache_result_bytes(),
         }
     }
 }
@@ -240,6 +257,14 @@ impl GatewayConfig {
             .is_err()
         {
             errors.push("gateway.listen_addr must be an IP socket address".into());
+        }
+        if self.cache.enabled
+            && (self.cache.max_capacity == 0
+                || self.cache.max_bytes == 0
+                || self.cache.max_result_bytes == 0
+                || self.cache.ttl_seconds == 0)
+        {
+            errors.push("enabled cache limits and TTL must be positive".into());
         }
         if self.auth.enabled && self.auth.api_keys.is_empty() {
             errors.push("auth.enabled requires at least one API key".into());
