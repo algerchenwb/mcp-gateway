@@ -1225,6 +1225,7 @@ name = "mcp-gateway-sdk"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
  "mcp-gateway-core",
  "reqwest",
  "serde",
@@ -1246,6 +1247,7 @@ dependencies = [
  "futures-util",
  "jsonschema",
  "mcp-gateway-core",
+ "mcp-gateway-sdk",
  "moka",
  "reqwest",
  "serde",
@@ -1267,6 +1269,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "mcp-gateway-core",
+ "mcp-gateway-sdk",
  "reqwest",
  "serde",
  "serde_json",

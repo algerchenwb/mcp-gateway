@@ -2,21 +2,17 @@
 //!
 //! Per the document: "客户端 SDK（Rust）"
 
-use std::time::Duration;
-
-use reqwest::Client as HttpClient;
 use serde_json::Value;
 
-use mcp_gateway_core::error::{McpError, McpResult};
+use mcp_gateway_core::error::McpResult;
 use mcp_gateway_core::tool::{Tool, ToolCallResult};
 use mcp_gateway_core::types::{
-    InitializeRequest, InitializeResult, Implementation, JsonRpcMessage, JsonRpcRequest,
-    RequestId,
+    Implementation, InitializeRequest, InitializeResult, JsonRpcMessage,
 };
 
 /// Client for communicating with the MCP Gateway.
 pub struct GatewayClient {
-    http_client: HttpClient,
+    transport: crate::transport::HttpTransport,
     base_url: String,
     api_key: Option<String>,
 }
@@ -28,71 +24,20 @@ impl GatewayClient {
     /// * `base_url` — URL of the gateway's MCP endpoint (e.g., `http://127.0.0.1:8080/mcp`)
     /// * `api_key` — optional API key for authentication
     pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
-        let http_client = HttpClient::builder()
-            .timeout(Duration::from_secs(30))
-            .build()
-            .expect("Failed to build HTTP client");
-
         Self {
-            http_client,
-            base_url: base_url.into(),
+            transport: crate::transport::HttpTransport::new(base_url.into(), api_key.clone()),
+            base_url: String::new(),
             api_key,
         }
+        .with_base_url()
     }
-
-    /// Send a JSON-RPC request and return the response value.
-    async fn send_request(
-        &self,
-        method: &str,
-        params: Option<Value>,
-    ) -> McpResult<Value> {
-        let id = RequestId::String(uuid::Uuid::new_v4().to_string());
-        let request = JsonRpcRequest::new(method, params, id.clone());
-
-        let mut req = self
-            .http_client
-            .post(&self.base_url)
-            .header("Content-Type", "application/json")
-            .json(&request);
-
-        if let Some(ref key) = self.api_key {
-            req = req.header("x-api-key", key);
-        }
-
-        let response = req.send().await.map_err(|e| {
-            McpError::BackendConnection(format!("HTTP request failed: {e}"))
-        })?;
-
-        let status = response.status();
-        let body: Value = response.json().await.map_err(|e| {
-            McpError::Serialization(format!("failed to parse response: {e}"))
-        })?;
-
-        if !status.is_success() {
-            let err_msg = body
-                .get("error")
-                .and_then(|e| e.get("message"))
-                .and_then(|m| m.as_str())
-                .unwrap_or("unknown error");
-            return Err(McpError::BackendConnection(format!(
-                "gateway returned {status}: {err_msg}"
-            )));
-        }
-
-        // Extract result from JSON-RPC response
-        let message: JsonRpcMessage = serde_json::from_value(body).map_err(|e| {
-            McpError::Serialization(format!("failed to parse JSON-RPC response: {e}"))
-        })?;
-
-        match message {
-            JsonRpcMessage::Response(resp) => {
-                resp.result.ok_or_else(|| McpError::InternalError("empty response".into()))
-            }
-            JsonRpcMessage::Error(err) => {
-                Err(McpError::InternalError(format!("{}: {}", err.error.code, err.error.message)))
-            }
-            _ => Err(McpError::InternalError("unexpected response type".into())),
-        }
+    fn with_base_url(mut self) -> Self {
+        self.base_url = self.transport.base_url().to_owned();
+        self
+    }
+    async fn send_request(&self, method: &str, params: Option<Value>) -> McpResult<Value> {
+        use crate::transport::Transport;
+        self.transport.send(method, params).await
     }
 
     /// Initialize the connection with the gateway.
@@ -111,13 +56,15 @@ impl GatewayClient {
         let result = self.send_request("initialize", Some(params)).await?;
         let init_result: InitializeResult = serde_json::from_value(result)?;
 
-        // Send initialized notification
-        let _ = self
-            .send_request(
-                "notifications/initialized",
-                Some(serde_json::json!({"protocolVersion": "2025-06-18"})),
-            )
-            .await;
+        self.transport
+            .exchange(JsonRpcMessage::Notification(
+                mcp_gateway_core::types::JsonRpcNotification {
+                    jsonrpc: "2.0".into(),
+                    method: "notifications/initialized".into(),
+                    params: None,
+                },
+            ))
+            .await?;
 
         Ok(init_result)
     }
@@ -164,6 +111,8 @@ impl GatewayClient {
     /// Set the API key.
     pub fn set_api_key(&mut self, key: impl Into<String>) {
         self.api_key = Some(key.into());
+        self.transport =
+            crate::transport::HttpTransport::new(self.base_url.clone(), self.api_key.clone());
     }
 }
 

@@ -1,117 +1,99 @@
-//! mcp-gateway-stdio — stdio-to-HTTP bridge.
-//!
-//! Reads JSON-RPC messages from stdin, forwards them to the MCP Gateway HTTP
-//! endpoint, and writes responses to stdout.
-//!
-//! This enables stdio-based MCP clients to connect to the gateway.
-//!
-//! Usage:
-//!   mcp-gateway-stdio --gateway http://localhost:8080/mcp
-//!
-//! Or as a bridge for a specific tool:
-//!   mcp-gateway-stdio --gateway http://localhost:8080/mcp --tool get_weather
-
+//! Newline-delimited stdio bridge using the same HTTP transport as the Rust SDK.
 use clap::Parser;
-use tokio::io::AsyncBufReadExt;
-
-use mcp_gateway_core::types::JsonRpcMessage;
-
+use mcp_gateway_core::types::{JsonRpcErrorResponse, JsonRpcMessage, RequestId};
+use mcp_gateway_sdk::transport::HttpTransport;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 #[derive(Parser)]
-#[command(name = "mcp-gateway-stdio")]
-#[command(about = "stdio-to-HTTP bridge for MCP Gateway")]
+#[command(
+    name = "mcp-gateway-stdio",
+    about = "stdio-to-HTTP bridge for MCP Gateway"
+)]
 struct Cli {
-    /// Gateway HTTP endpoint URL.
     #[arg(short, long, default_value = "http://127.0.0.1:8080/mcp")]
     gateway: String,
-
-    /// Optional API key for authentication.
+    /// Prefer MCP_GATEWAY_API_KEY to avoid process-list exposure.
     #[arg(short, long)]
     api_key: Option<String>,
-
-    /// Verbose output.
     #[arg(short, long)]
     verbose: bool,
 }
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
-
-    if cli.verbose {
-        eprintln!("MCP Gateway stdio bridge");
-        eprintln!("Gateway: {}", cli.gateway);
-    }
-
-    let http_client = reqwest::Client::new();
-    let stdin = tokio::io::BufReader::new(tokio::io::stdin());
-    let mut lines = stdin.lines();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        let line = line.trim().to_string();
-        if line.is_empty() {
+    let key = cli
+        .api_key
+        .or_else(|| std::env::var("MCP_GATEWAY_API_KEY").ok());
+    let transport = HttpTransport::new(cli.gateway, key);
+    let mut stdin = tokio::io::BufReader::new(tokio::io::stdin());
+    let mut stdout = tokio::io::stdout();
+    loop {
+        // Bound a line without buffering unbounded stdin data.
+        let mut line = Vec::new();
+        loop {
+            let available = match stdin.fill_buf().await {
+                Ok(bytes) => bytes,
+                Err(_) => return,
+            };
+            if available.is_empty() {
+                if line.is_empty() {
+                    return;
+                }
+                break;
+            }
+            let count = available
+                .iter()
+                .position(|b| *b == b'\n')
+                .map_or(available.len(), |p| p + 1);
+            if line.len() + count > 2 * 1024 * 1024 {
+                eprintln!("stdio message exceeds 2 MiB");
+                return;
+            }
+            let newline = available[count - 1] == b'\n';
+            line.extend_from_slice(&available[..count]);
+            stdin.consume(count);
+            if newline {
+                break;
+            }
+        }
+        if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
-
-        if cli.verbose {
-            eprintln!("→ forwarding: {line}");
-        }
-
-        // Parse the incoming JSON-RPC message
-        let message: JsonRpcMessage = match serde_json::from_str(&line) {
-            Ok(m) => m,
-            Err(e) => {
-                let error = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": null,
-                    "error": {
-                        "code": -32700,
-                        "message": format!("Parse error: {}", e)
+        let result = match serde_json::from_slice::<JsonRpcMessage>(&line) {
+            Ok(message) => {
+                let id = message.id().cloned();
+                let notification = matches!(message, JsonRpcMessage::Notification(_));
+                match transport.exchange(message).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        if cli.verbose {
+                            eprintln!("gateway call failed: {error}");
+                        }
+                        if notification {
+                            None
+                        } else {
+                            Some(JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                                id.unwrap_or(RequestId::Null),
+                                error.to_error_code(),
+                                error.to_string(),
+                            )))
+                        }
                     }
-                });
-                println!("{error}");
-                continue;
+                }
             }
+            Err(_) => Some(JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                RequestId::Null,
+                -32700,
+                "invalid JSON-RPC input",
+            ))),
         };
-
-        // Forward to the gateway
-        let mut request = http_client
-            .post(&cli.gateway)
-            .header("Content-Type", "application/json");
-
-        if let Some(ref key) = cli.api_key {
-            request = request.header("x-api-key", key);
-        }
-
-        let response = match request.body(line).send().await {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("Error forwarding to gateway: {e}");
-                let error = serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": message.id().map(|id| id.to_string()).unwrap_or_default(),
-                    "error": {
-                        "code": -32603,
-                        "message": format!("Gateway connection error: {e}")
-                    }
-                });
-                println!("{error}");
+        if let Some(response) = result {
+            let Ok(mut output) = serde_json::to_vec(&response) else {
                 continue;
+            };
+            output.push(b'\n');
+            if stdout.write_all(&output).await.is_err() || stdout.flush().await.is_err() {
+                return;
             }
-        };
-
-        let response_text = match response.text().await {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("Error reading gateway response: {e}");
-                continue;
-            }
-        };
-
-        // Write the response to stdout
-        println!("{response_text}");
-
-        if cli.verbose {
-            eprintln!("← response: {response_text}");
         }
     }
 }

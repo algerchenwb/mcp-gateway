@@ -7,6 +7,7 @@ authors.workspace = true
 description = "MCP Gateway server - HTTP server, routing, proxy, caching, auth"
 
 [dependencies]
+mcp-gateway-sdk = { path = "../mcp-gateway-sdk" }
 mcp-gateway-core = { path = "../mcp-gateway-core" }
 tokio.workspace = true
 serde.workspace = true

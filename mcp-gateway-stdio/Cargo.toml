@@ -11,6 +11,7 @@ name = "mcp-gateway-stdio"
 path = "src/main.rs"
 
 [dependencies]
+mcp-gateway-sdk = { path = "../mcp-gateway-sdk" }
 mcp-gateway-core = { path = "../mcp-gateway-core" }
 tokio.workspace = true
 serde.workspace = true

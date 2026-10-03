@@ -29,7 +29,7 @@ pub fn build_router(state: AppState) -> Router {
         // Streamable HTTP — the primary JSON-RPC endpoint
         .route(
             "/mcp",
-            axum::routing::post(crate::handlers::json_rpc::handle),
+            axum::routing::post(crate::handlers::streamable_http::handle),
         )
         // SSE transport — persistent connection
         .route("/mcp/sse", axum::routing::get(crate::handlers::sse::handle))

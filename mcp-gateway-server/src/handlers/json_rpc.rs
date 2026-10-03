@@ -28,15 +28,19 @@ pub async fn handle(
     let message: JsonRpcMessage = serde_json::from_value(body)
         .map_err(|e| json_error(RequestId::Null, error_codes::PARSE_ERROR, e.to_string()))?;
 
+    let scope = credential_scope(&state, &headers);
+    process_message_scoped(state, message, &scope).await
+}
+
+pub fn credential_scope(state: &AppState, headers: &axum::http::HeaderMap) -> String {
     use sha2::{Digest, Sha256};
     let credential = headers
         .get(&state.config.auth.api_key_header)
         .or_else(|| headers.get("authorization"));
-    let scope = credential.map_or_else(
+    credential.map_or_else(
         || "public".to_string(),
         |value| format!("{:x}", Sha256::digest(value.as_bytes())),
-    );
-    process_message_scoped(state, message, &scope).await
+    )
 }
 
 /// Core message processing logic, shared across transport handlers.
@@ -118,7 +122,7 @@ async fn handle_notification(
 
 /// Handle `initialize` — MCP capability negotiation.
 fn handle_initialize(id: RequestId, params: Option<Value>) -> JsonRpcMessage {
-    let _init_req: InitializeRequest = match params {
+    let init_req: InitializeRequest = match params {
         Some(p) => match serde_json::from_value(p) {
             Ok(r) => r,
             Err(e) => {
@@ -139,7 +143,13 @@ fn handle_initialize(id: RequestId, params: Option<Value>) -> JsonRpcMessage {
     };
 
     let result = InitializeResult {
-        protocol_version: "2025-06-18".to_string(),
+        protocol_version: if mcp_gateway_sdk::transport::SUPPORTED_VERSIONS
+            .contains(&init_req.protocol_version.as_str())
+        {
+            init_req.protocol_version
+        } else {
+            mcp_gateway_sdk::transport::PROTOCOL_VERSION.into()
+        },
         capabilities: ServerCapabilities {
             tools: Some(ToolsCapability {
                 list_changed: Some(false),
