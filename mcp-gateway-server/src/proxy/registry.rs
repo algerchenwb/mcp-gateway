@@ -9,7 +9,10 @@ use mcp_gateway_core::{
 };
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 use tokio::sync::Mutex;
@@ -22,7 +25,29 @@ pub struct ToolEntry {
 }
 pub struct BackendRegistry {
     backends: Vec<(Arc<BackendConfig>, Arc<BackendClient>)>,
-    catalog: Mutex<Option<(Instant, HashMap<String, ToolEntry>)>>,
+    catalog: Mutex<Option<(Instant, HashMap<String, ToolPool>)>>,
+}
+struct ToolPool {
+    entries: Vec<ToolEntry>,
+    next: AtomicU64,
+}
+impl ToolPool {
+    fn select(&self) -> ToolEntry {
+        let total: u64 = self
+            .entries
+            .iter()
+            .map(|entry| u64::from(entry.backend.weight))
+            .sum();
+        let mut ticket = self.next.fetch_add(1, Ordering::Relaxed) % total;
+        for entry in &self.entries {
+            let weight = u64::from(entry.backend.weight);
+            if ticket < weight {
+                return entry.clone();
+            }
+            ticket -= weight;
+        }
+        unreachable!("positive validated replica weights")
+    }
 }
 struct NoNetwork;
 impl jsonschema::Retrieve for NoNetwork {
@@ -95,20 +120,36 @@ impl BackendRegistry {
             },
         ))
         .await;
-        let mut entries = HashMap::new();
+        let mut entries: HashMap<String, ToolPool> = HashMap::new();
         for list in lists {
             let (config, client, tools) = list?;
             let mut available = std::collections::HashSet::new();
             for tool in tools {
-                available.insert(tool.name.clone());
+                if !available.insert(tool.name.clone()) {
+                    return Err(McpError::Config(format!(
+                        "backend '{}' advertised duplicate tool '{}'",
+                        config.name, tool.name
+                    )));
+                }
                 if !config.tools.is_empty() && !config.tools.contains(&tool.name) {
                     continue;
                 }
-                if entries.contains_key(&tool.name) {
-                    return Err(McpError::Config(format!(
-                        "duplicate discovered tool name '{}'",
-                        tool.name
-                    )));
+                if let Some(pool) = entries.get(&tool.name) {
+                    let existing = &pool.entries[0];
+                    if config.replica_group.is_none()
+                        || config.replica_group != existing.backend.replica_group
+                    {
+                        return Err(McpError::Config(format!("duplicate discovered tool '{}' requires the same explicit replica_group", tool.name)));
+                    }
+                    if serde_json::to_value(&tool)? != serde_json::to_value(&existing.tool)? {
+                        return Err(McpError::Config(format!(
+                            "replica tool '{}' has inconsistent definitions",
+                            tool.name
+                        )));
+                    }
+                }
+                if config.weight == 0 {
+                    return Err(McpError::Config("replica weight must be positive".into()));
                 }
                 let validator = jsonschema::options()
                     .with_retriever(NoNetwork)
@@ -116,15 +157,20 @@ impl BackendRegistry {
                     .map_err(|_| {
                         McpError::Config(format!("invalid inputSchema for '{}'", tool.name))
                     })?;
-                entries.insert(
-                    tool.name.clone(),
-                    ToolEntry {
-                        tool,
-                        backend: config.clone(),
-                        client: client.clone(),
-                        validator: Arc::new(validator),
-                    },
-                );
+                let entry = ToolEntry {
+                    tool: tool.clone(),
+                    backend: config.clone(),
+                    client: client.clone(),
+                    validator: Arc::new(validator),
+                };
+                entries
+                    .entry(tool.name)
+                    .or_insert_with(|| ToolPool {
+                        entries: Vec::new(),
+                        next: AtomicU64::new(0),
+                    })
+                    .entries
+                    .push(entry);
             }
             for configured in &config.tools {
                 if !available.contains(configured) {
@@ -143,7 +189,12 @@ impl BackendRegistry {
         let catalog = self.catalog.lock().await;
         Ok(catalog
             .as_ref()
-            .map(|(_, entries)| entries.values().cloned().collect())
+            .map(|(_, entries)| {
+                entries
+                    .values()
+                    .map(|pool| pool.entries[0].clone())
+                    .collect()
+            })
             .unwrap_or_default())
     }
     pub async fn resolve(&self, name: &str) -> McpResult<Option<ToolEntry>> {
@@ -152,7 +203,7 @@ impl BackendRegistry {
         Ok(catalog
             .as_ref()
             .and_then(|(_, entries)| entries.get(name))
-            .cloned())
+            .map(ToolPool::select))
     }
     pub async fn shutdown(&self) {
         for (_, client) in &self.backends {

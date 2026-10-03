@@ -96,9 +96,7 @@ pub struct BackendConfig {
     /// Fixed backend credentials; inbound credentials are never forwarded.
     #[serde(default)]
     pub headers: std::collections::HashMap<String, String>,
-    /// Tools this backend provides. The gateway routes tool calls to the
-    /// first backend that lists the requested tool. If empty, all tools
-    /// from this backend are available.
+    /// Tool allowlist. If empty, all discovered tools are available.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
     /// Explicit allowlist of read-only tools whose successful results may be cached.
@@ -110,7 +108,10 @@ pub struct BackendConfig {
     /// Maximum number of concurrent connections.
     #[serde(default = "default_max_connections")]
     pub max_connections: usize,
-    /// Weight for load balancing (Phase 2+).
+    /// Explicit replica group allowing identical tool names across members.
+    #[serde(default)]
+    pub replica_group: Option<String>,
+    /// Positive weight for deterministic weighted round-robin routing.
     #[serde(default = "default_weight")]
     pub weight: u32,
 }
@@ -153,6 +154,7 @@ impl Default for BackendConfig {
             cache_tools: Vec::new(),
             timeout_ms: default_timeout(),
             max_connections: default_max_connections(),
+            replica_group: None,
             weight: default_weight(),
         }
     }
@@ -390,7 +392,7 @@ impl GatewayConfig {
             }
         }
         let mut backend_names = std::collections::HashSet::new();
-        let mut tool_names = std::collections::HashSet::new();
+        let mut tool_names = std::collections::HashMap::new();
         for (i, backend) in self.backends.iter().enumerate() {
             if backend.name.is_empty() || !backend_names.insert(&backend.name) {
                 errors.push(format!(
@@ -429,11 +431,27 @@ impl GatewayConfig {
                     errors.push(format!("backends[{i}]: invalid backend header"));
                 }
             }
+            if backend.weight == 0
+                || backend
+                    .replica_group
+                    .as_ref()
+                    .is_some_and(|g| g.trim().is_empty())
+            {
+                errors.push(format!(
+                    "backends[{i}]: weight must be positive and replica_group nonempty"
+                ));
+            }
+            let mut local_tools = std::collections::HashSet::new();
             for tool in &backend.tools {
-                if tool.is_empty() || !tool_names.insert(tool) {
+                if tool.is_empty() || !local_tools.insert(tool) {
                     errors.push(format!(
-                        "backends[{i}]: tool names must be nonempty and unique"
+                        "backends[{i}]: tool names must be nonempty and locally unique"
                     ));
+                }
+                if let Some(previous) = tool_names.insert(tool, backend.replica_group.as_ref()) {
+                    if previous.is_none() || previous != backend.replica_group.as_ref() {
+                        errors.push(format!("backends[{i}]: duplicate tool requires the same explicit replica_group"));
+                    }
                 }
             }
             match backend.transport_type() {
