@@ -17,6 +17,7 @@ pub struct AppState {
     pub backends: Arc<crate::proxy::registry::BackendRegistry>,
     pub sse: Arc<crate::handlers::sse::SseSessions>,
     pub inflight: Arc<tokio::sync::Semaphore>,
+    pub oauth: Option<Arc<crate::auth::oauth::OAuthVerifier>>,
 }
 
 impl AppState {
@@ -29,6 +30,11 @@ impl AppState {
         ));
         let backends = Arc::new(crate::proxy::registry::BackendRegistry::new(&config));
         Self {
+            oauth: config
+                .auth
+                .oauth
+                .clone()
+                .map(|oauth| Arc::new(crate::auth::oauth::OAuthVerifier::new(oauth))),
             inflight: Arc::new(tokio::sync::Semaphore::new(
                 config.gateway.max_inflight_requests,
             )),
@@ -55,6 +61,14 @@ impl AppState {
 /// - GET  /metrics      → Metrics endpoint
 pub fn build_router(state: AppState) -> Router {
     Router::new()
+        .route(
+            "/.well-known/oauth-protected-resource",
+            axum::routing::get(crate::auth::oauth::metadata),
+        )
+        .route(
+            "/.well-known/oauth-protected-resource/mcp",
+            axum::routing::get(crate::auth::oauth::metadata),
+        )
         // Streamable HTTP — the primary JSON-RPC endpoint
         .route(
             "/mcp",

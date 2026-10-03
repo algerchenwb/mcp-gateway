@@ -54,9 +54,17 @@ pub async fn process_message_scoped(
     message: JsonRpcMessage,
     scope: &str,
 ) -> Result<Json<Value>, Json<Value>> {
+    process_message_authorized(state, message, scope, None).await
+}
+pub async fn process_message_authorized(
+    state: AppState,
+    message: JsonRpcMessage,
+    scope: &str,
+    principal: Option<crate::auth::oauth::Principal>,
+) -> Result<Json<Value>, Json<Value>> {
     match message {
         JsonRpcMessage::Request(req) => {
-            let resp = handle_request(state.clone(), req, scope).await;
+            let resp = handle_request(state.clone(), req, scope, principal.as_ref()).await;
             if matches!(resp, JsonRpcMessage::Error(_)) {
                 state.metrics.record_rpc_error();
             }
@@ -82,13 +90,36 @@ pub async fn process_message_scoped(
 }
 
 /// Route a JSON-RPC request to the appropriate handler.
-async fn handle_request(state: AppState, req: JsonRpcRequest, scope: &str) -> JsonRpcMessage {
+async fn handle_request(
+    state: AppState,
+    req: JsonRpcRequest,
+    scope: &str,
+    principal: Option<&crate::auth::oauth::Principal>,
+) -> JsonRpcMessage {
     let method = req.method.as_str();
 
     match method {
         "initialize" => handle_initialize(req.id, req.params),
-        "tools/list" => handle_tools_list(state, req.id).await,
-        "tools/call" => handle_tools_call(state, req.id, req.params, scope).await,
+        "tools/list" => handle_tools_list(state, req.id, principal).await,
+        "tools/call" => {
+            if let (Some(oauth), Some(principal)) = (&state.config.auth.oauth, principal) {
+                if let Some(name) = req
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    if !crate::auth::oauth::allows_tool(oauth, principal, name) {
+                        return JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                            req.id,
+                            error_codes::INVALID_PARAMS,
+                            "tool access denied",
+                        ));
+                    }
+                }
+            }
+            handle_tools_call(state, req.id, req.params, scope).await
+        }
         "ping" => handle_ping(req.id),
         _ => JsonRpcMessage::Error(JsonRpcErrorResponse::new(
             req.id,
@@ -174,9 +205,18 @@ fn handle_initialize(id: RequestId, params: Option<Value>) -> JsonRpcMessage {
 }
 
 /// Handle `tools/list` — list all tools from all configured backends.
-async fn handle_tools_list(state: AppState, id: RequestId) -> JsonRpcMessage {
+async fn handle_tools_list(
+    state: AppState,
+    id: RequestId,
+    principal: Option<&crate::auth::oauth::Principal>,
+) -> JsonRpcMessage {
     match state.backends.tools().await {
         Ok(mut entries) => {
+            if let (Some(oauth), Some(principal)) = (&state.config.auth.oauth, principal) {
+                entries.retain(|entry| {
+                    crate::auth::oauth::allows_tool(oauth, principal, &entry.tool.name)
+                });
+            }
             entries.sort_by(|a, b| a.tool.name.cmp(&b.tool.name));
             let tools: Vec<_> = entries.into_iter().map(|entry| entry.tool).collect();
             JsonRpcMessage::Response(JsonRpcResponse::new(id, serde_json::json!({"tools":tools})))
@@ -315,6 +355,21 @@ fn json_error(id: RequestId, code: i32, message: impl Into<String>) -> Json<Valu
 
 fn json_error_value(id: RequestId, code: i32, message: impl Into<String>) -> Value {
     serde_json::to_value(JsonRpcErrorResponse::new(id, code, message)).unwrap_or_default()
+}
+
+pub fn authorized_scope(
+    state: &AppState,
+    headers: &axum::http::HeaderMap,
+    principal: Option<&crate::auth::oauth::Principal>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    if let Some(principal) = principal {
+        let scopes: std::collections::BTreeSet<_> = principal.scopes.iter().collect();
+        let material = serde_json::json!([principal.issuer, principal.subject, scopes]);
+        format!("{:x}", Sha256::digest(material.to_string().as_bytes()))
+    } else {
+        credential_scope(state, headers)
+    }
 }
 
 #[cfg(test)]

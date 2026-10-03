@@ -167,9 +167,25 @@ pub struct AuthConfig {
     /// List of valid API keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub api_keys: Vec<String>,
+    #[serde(default)]
+    pub api_key_env: Vec<String>,
+    #[serde(default)]
+    pub oauth: Option<OAuthConfig>,
     /// Header name for the API key.
     #[serde(default = "default_api_key_header")]
     pub api_key_header: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthConfig {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_url: String,
+    pub resource_url: String,
+    #[serde(default)]
+    pub required_scopes: Vec<String>,
+    #[serde(default)]
+    pub tool_scopes: std::collections::HashMap<String, Vec<String>>,
 }
 
 fn default_api_key_header() -> String {
@@ -181,6 +197,8 @@ impl Default for AuthConfig {
         Self {
             enabled: false,
             api_keys: Vec::new(),
+            api_key_env: Vec::new(),
+            oauth: None,
             api_key_header: default_api_key_header(),
         }
     }
@@ -263,7 +281,24 @@ impl GatewayConfig {
     /// Load configuration from a TOML file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, Box<dyn std::error::Error>> {
         let content = std::fs::read_to_string(path)?;
-        let config: GatewayConfig = toml::from_str(&content)?;
+        let mut config: GatewayConfig = toml::from_str(&content)?;
+        for name in &config.auth.api_key_env {
+            let key = std::env::var(name)
+                .map_err(|_| format!("missing API key environment variable '{name}'"))?;
+            if key.is_empty() {
+                return Err(format!("empty API key environment variable '{name}'").into());
+            }
+            config.auth.api_keys.push(key);
+        }
+        // ${ENV_NAME} placeholders allow credentials to stay out of committed TOML files.
+        for backend in &mut config.backends {
+            for value in backend.headers.values_mut().chain(backend.env.values_mut()) {
+                if let Some(name) = value.strip_prefix("${").and_then(|v| v.strip_suffix('}')) {
+                    *value = std::env::var(name)
+                        .map_err(|_| format!("missing backend environment variable '{name}'"))?;
+                }
+            }
+        }
         Ok(config)
     }
 
@@ -302,7 +337,7 @@ impl GatewayConfig {
         {
             errors.push("enabled cache limits and TTL must be positive".into());
         }
-        if self.auth.enabled && self.auth.api_keys.is_empty() {
+        if self.auth.enabled && self.auth.api_keys.is_empty() && self.auth.oauth.is_none() {
             errors.push("auth.enabled requires at least one API key".into());
         }
         if self
@@ -312,6 +347,47 @@ impl GatewayConfig {
             .is_err()
         {
             errors.push("auth.api_key_header is invalid".into());
+        }
+        if let Some(oauth) = &self.auth.oauth {
+            if !self.auth.enabled {
+                errors.push("auth.oauth requires auth.enabled=true".into());
+            }
+            for (name, value) in [
+                ("issuer", &oauth.issuer),
+                ("jwks_url", &oauth.jwks_url),
+                ("resource_url", &oauth.resource_url),
+            ] {
+                if !reqwest::Url::parse(value).is_ok_and(|url| {
+                    url.username().is_empty()
+                        && url.password().is_none()
+                        && (url.scheme() == "https"
+                            || (url.scheme() == "http"
+                                && matches!(
+                                    url.host_str(),
+                                    Some("localhost" | "127.0.0.1" | "[::1]")
+                                )))
+                }) {
+                    errors.push(format!(
+                        "auth.oauth.{name} must use HTTPS (HTTP is allowed only for localhost)"
+                    ));
+                }
+            }
+            if oauth.audience.is_empty() {
+                errors.push("auth.oauth.audience must not be empty".into());
+            }
+            if oauth
+                .required_scopes
+                .iter()
+                .chain(oauth.tool_scopes.values().flatten())
+                .any(|scope| {
+                    scope.is_empty()
+                        || scope
+                            .chars()
+                            .any(|c| !('!'..='~').contains(&c) || c == '"' || c == '\\')
+                })
+            {
+                errors.push("OAuth scopes must be nonempty printable tokens".into());
+            }
         }
         let mut backend_names = std::collections::HashSet::new();
         let mut tool_names = std::collections::HashSet::new();
@@ -408,8 +484,8 @@ tools = ["echo"]
         assert_eq!(config.gateway.name, "test-gateway");
         assert_eq!(config.backends.len(), 1);
         assert_eq!(config.backends[0].name, "echo");
-        assert!(config.auth.enabled == false);
-        assert!(config.cache.enabled == true);
+        assert!(!config.auth.enabled);
+        assert!(config.cache.enabled);
     }
 
     #[test]
@@ -429,6 +505,7 @@ transport = "stdio"
 }
 #[cfg(test)]
 mod validation_tests {
+    #![allow(clippy::field_reassign_with_default)]
     use super::*;
     #[test]
     fn invalid_transport_and_duplicate_names_are_rejected() {

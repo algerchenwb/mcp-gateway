@@ -305,10 +305,7 @@ impl StdioConnection {
         // Drain stderr without retaining or logging backend secrets.
         let stderr = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
-            loop {
-                let Ok(bytes) = reader.fill_buf().await else {
-                    break;
-                };
+            while let Ok(bytes) = reader.fill_buf().await {
                 if bytes.is_empty() {
                     break;
                 }

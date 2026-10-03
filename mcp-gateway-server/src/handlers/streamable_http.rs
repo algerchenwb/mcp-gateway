@@ -9,7 +9,12 @@ use axum::{
 };
 use mcp_gateway_core::types::{error_codes, JsonRpcErrorResponse, JsonRpcMessage, RequestId};
 
-pub async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn handle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    principal: Option<axum::Extension<crate::auth::oauth::Principal>>,
+    body: Bytes,
+) -> Response {
     let Ok(_permit) = state.inflight.clone().try_acquire_owned() else {
         return StatusCode::TOO_MANY_REQUESTS.into_response();
     };
@@ -55,8 +60,10 @@ pub async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Byt
         return protocol_error(error_codes::INVALID_REQUEST, "unsolicited client response");
     }
     let notification = matches!(message, JsonRpcMessage::Notification(_));
-    let scope = super::json_rpc::credential_scope(&state, &headers);
-    let response = super::json_rpc::process_message_scoped(state, message, &scope).await;
+    let principal = principal.map(|p| p.0);
+    let scope = super::json_rpc::authorized_scope(&state, &headers, principal.as_ref());
+    let response =
+        super::json_rpc::process_message_authorized(state, message, &scope, principal).await;
     if notification {
         return StatusCode::ACCEPTED.into_response();
     }

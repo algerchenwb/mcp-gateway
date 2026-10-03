@@ -39,3 +39,10 @@ jsonschema = "0.47"
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
 sha2 = "0.10"
+
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+[dev-dependencies]
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+base64 = "0.22"

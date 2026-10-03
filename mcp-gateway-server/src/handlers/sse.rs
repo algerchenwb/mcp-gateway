@@ -65,6 +65,7 @@ impl Drop for SessionStream {
 pub async fn handle(
     State(state): State<AppState>,
     headers: HeaderMap,
+    principal: Option<axum::Extension<crate::auth::oauth::Principal>>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, StatusCode> {
     let permit = state
         .sse
@@ -73,7 +74,8 @@ pub async fn handle(
         .try_acquire_owned()
         .map_err(|_| StatusCode::TOO_MANY_REQUESTS)?;
     let id = uuid::Uuid::new_v4().to_string();
-    let scope = super::json_rpc::credential_scope(&state, &headers);
+    let principal = principal.map(|p| p.0);
+    let scope = super::json_rpc::authorized_scope(&state, &headers, principal.as_ref());
     let (sender, receiver) = mpsc::channel(state.sse.queue_capacity);
     state.sse.sessions.insert(
         id.clone(),
@@ -105,12 +107,14 @@ pub async fn handle_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: HeaderMap,
+    principal: Option<axum::Extension<crate::auth::oauth::Principal>>,
     body: Bytes,
 ) -> StatusCode {
     let Ok(inflight) = state.inflight.clone().try_acquire_owned() else {
         return StatusCode::TOO_MANY_REQUESTS;
     };
-    let scope = super::json_rpc::credential_scope(&state, &headers);
+    let principal = principal.map(|p| p.0);
+    let scope = super::json_rpc::authorized_scope(&state, &headers, principal.as_ref());
     let sender = {
         let Some(session) = state.sse.sessions.get(&id) else {
             return StatusCode::NOT_FOUND;
@@ -142,7 +146,8 @@ pub async fn handle_message(
         return StatusCode::BAD_REQUEST;
     }
     if matches!(message, JsonRpcMessage::Notification(_)) {
-        let _ = super::json_rpc::process_message_scoped(state, message, &scope).await;
+        let _ =
+            super::json_rpc::process_message_authorized(state, message, &scope, principal).await;
         return StatusCode::ACCEPTED;
     }
     // Reserve a bounded response slot before executing the tool, so saturation cannot trigger duplicate writes.
@@ -152,7 +157,8 @@ pub async fn handle_message(
     };
     tokio::spawn(async move {
         let _inflight = inflight;
-        let response = super::json_rpc::process_message_scoped(state, message, &scope).await;
+        let response =
+            super::json_rpc::process_message_authorized(state, message, &scope, principal).await;
         let value = match response {
             Ok(value) | Err(value) => value.0,
         };

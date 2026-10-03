@@ -7,8 +7,14 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
-pub async fn auth_layer(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if matches!(req.uri().path(), "/health" | "/ready") {
+pub async fn auth_layer(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    if matches!(
+        req.uri().path(),
+        "/health"
+            | "/ready"
+            | "/.well-known/oauth-protected-resource"
+            | "/.well-known/oauth-protected-resource/mcp"
+    ) {
         return next.run(req).await;
     }
     if req.uri().path().starts_with("/mcp") {
@@ -39,12 +45,44 @@ pub async fn auth_layer(State(state): State<AppState>, req: Request, next: Next)
                     .and_then(|v| v.strip_prefix("Bearer "))
             });
         if !key.is_some_and(|key| config.api_keys.iter().any(|valid| valid == key)) {
-            return (
-                StatusCode::UNAUTHORIZED,
-                [("www-authenticate", "Bearer realm=\"mcp-gateway\"")],
-            )
-                .into_response();
+            let bearer = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match (&state.oauth, bearer) {
+                (Some(verifier), Some(token)) => match verifier.verify(token).await {
+                    Ok(principal) => {
+                        req.extensions_mut().insert(principal);
+                    }
+                    Err(crate::auth::oauth::AuthError::Unavailable) => {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                    Err(crate::auth::oauth::AuthError::InsufficientScope) => {
+                        return challenge(&state, StatusCode::FORBIDDEN, "insufficient_scope")
+                    }
+                    Err(crate::auth::oauth::AuthError::InvalidToken) => {
+                        return challenge(&state, StatusCode::UNAUTHORIZED, "invalid_token")
+                    }
+                },
+                _ => return challenge(&state, StatusCode::UNAUTHORIZED, "invalid_token"),
+            }
         }
     }
     next.run(req).await
+}
+
+fn challenge(state: &AppState, status: StatusCode, error: &str) -> Response {
+    let value = if let Some(oauth) = &state.config.auth.oauth {
+        let origin = reqwest::Url::parse(&oauth.resource_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        format!("Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\", error=\"{error}\", scope=\"{}\"",oauth.required_scopes.join(" "))
+    } else {
+        "Bearer realm=\"mcp-gateway\"".into()
+    };
+    match axum::http::HeaderValue::from_str(&value) {
+        Ok(value) => (status, [(axum::http::header::WWW_AUTHENTICATE, value)]).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
