@@ -5,6 +5,8 @@ use thiserror::Error;
 /// Unified error type for the MCP Gateway.
 #[derive(Error, Debug)]
 pub enum McpError {
+    #[error("JSON-RPC error: {0:?}")]
+    Rpc(crate::types::ErrorDetail),
     // ── JSON-RPC 2.0 Protocol Errors ──
     #[error("Parse error: {0}")]
     ParseError(String),
@@ -67,6 +69,7 @@ impl McpError {
     /// Convert to a JSON-RPC 2.0 error code.
     pub fn to_error_code(&self) -> i32 {
         match self {
+            McpError::Rpc(detail) => detail.code,
             McpError::ParseError(_) => error_codes::PARSE_ERROR,
             McpError::InvalidRequest(_) => error_codes::INVALID_REQUEST,
             McpError::MethodNotFound(_) => error_codes::METHOD_NOT_FOUND,

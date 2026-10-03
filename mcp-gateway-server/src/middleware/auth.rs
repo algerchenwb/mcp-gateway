@@ -1,28 +1,127 @@
-//! Auth middleware — tower Layer for API key authentication.
-//!
-//! Phase 1: simple pass-through. Auth enforcement happens in the JSON-RPC handler
-//! which has access to AppState. The middleware here just logs auth headers.
+//! Shared authentication and Origin validation for all MCP transports.
+use crate::server::AppState;
+use axum::{
+    extract::{Request, State},
+    http::StatusCode,
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 
-use axum::extract::Request;
-use axum::middleware::Next;
-use axum::response::Response;
+pub async fn auth_layer(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
+    if matches!(
+        req.uri().path(),
+        "/health"
+            | "/ready"
+            | "/.well-known/oauth-protected-resource"
+            | "/.well-known/oauth-protected-resource/mcp"
+    ) {
+        return next.run(req).await;
+    }
+    if req.uri().path().starts_with("/mcp") {
+        if let Some(origin) = req.headers().get("origin") {
+            let allowed = origin.to_str().ok().is_some_and(|origin| {
+                state
+                    .config
+                    .gateway
+                    .allowed_origins
+                    .iter()
+                    .any(|allowed| allowed == origin)
+            });
+            if !allowed {
+                return StatusCode::FORBIDDEN.into_response();
+            }
+        }
+    }
+    let config = &state.config.auth;
+    if config.enabled {
+        let key = req
+            .headers()
+            .get(&config.api_key_header)
+            .and_then(|v| v.to_str().ok())
+            .or_else(|| {
+                req.headers()
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.strip_prefix("Bearer "))
+            });
+        if !key.is_some_and(|key| config.api_keys.iter().any(|valid| valid == key)) {
+            let bearer = req
+                .headers()
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.strip_prefix("Bearer "));
+            match (&state.oauth, bearer) {
+                (Some(verifier), Some(token)) => match verifier.verify(token).await {
+                    Ok(principal) => {
+                        req.extensions_mut().insert(principal);
+                    }
+                    Err(crate::auth::oauth::AuthError::Unavailable) => {
+                        return StatusCode::SERVICE_UNAVAILABLE.into_response()
+                    }
+                    Err(crate::auth::oauth::AuthError::InsufficientScope) => {
+                        return challenge(&state, StatusCode::FORBIDDEN, "insufficient_scope")
+                    }
+                    Err(crate::auth::oauth::AuthError::InvalidToken) => {
+                        return challenge(&state, StatusCode::UNAUTHORIZED, "invalid_token")
+                    }
+                },
+                _ => return challenge(&state, StatusCode::UNAUTHORIZED, "invalid_token"),
+            }
+        }
+    }
+    next.run(req).await
+}
 
-/// Auth middleware — logs auth headers, enforcement in handler.
-pub async fn auth_layer(
-    req: Request,
+fn challenge(state: &AppState, status: StatusCode, error: &str) -> Response {
+    let value = if let Some(oauth) = &state.config.auth.oauth {
+        let origin = reqwest::Url::parse(&oauth.resource_url)
+            .map(|url| url.origin().ascii_serialization())
+            .unwrap_or_default();
+        format!("Bearer resource_metadata=\"{origin}/.well-known/oauth-protected-resource\", error=\"{error}\", scope=\"{}\"",oauth.required_scopes.join(" "))
+    } else {
+        "Bearer realm=\"mcp-gateway\"".into()
+    };
+    match axum::http::HeaderValue::from_str(&value) {
+        Ok(value) => (status, [(axum::http::header::WWW_AUTHENTICATE, value)]).into_response(),
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
+}
+
+#[derive(Clone)]
+pub struct AdmissionPermit(pub std::sync::Arc<tokio::sync::OwnedSemaphorePermit>);
+pub async fn admission_layer(
+    State(state): State<AppState>,
+    mut req: Request,
     next: Next,
 ) -> Response {
-    // Log auth headers for observability
-    if let Some(auth) = req.headers().get("Authorization") {
-        if let Ok(auth_str) = auth.to_str() {
-            tracing::debug!(auth_header = auth_str, "auth header present");
-        }
+    if req.method() == axum::http::Method::POST && req.uri().path().starts_with("/mcp") {
+        let permit = match state.inflight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Cancellation must remain available when ordinary requests exhaust capacity.
+                let Ok(permit) = state.control.clone().try_acquire_owned() else {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                };
+                let (parts, body) = req.into_parts();
+                let Ok(Ok(bytes)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    axum::body::to_bytes(body, 4096),
+                )
+                .await
+                else {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                };
+                let is_cancel = matches!(serde_json::from_slice::<mcp_gateway_core::types::JsonRpcMessage>(&bytes),
+                    Ok(mcp_gateway_core::types::JsonRpcMessage::Notification(n)) if n.method == "notifications/cancelled");
+                if !is_cancel {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+                req = Request::from_parts(parts, axum::body::Body::from(bytes));
+                permit
+            }
+        };
+        req.extensions_mut()
+            .insert(AdmissionPermit(std::sync::Arc::new(permit)));
     }
-    if let Some(key) = req.headers().get("x-api-key") {
-        if let Ok(key_str) = key.to_str() {
-            tracing::debug!(api_key = key_str, "api key header present");
-        }
-    }
-
     next.run(req).await
 }

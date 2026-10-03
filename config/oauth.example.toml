@@ -1,0 +1,32 @@
+[gateway]
+name = "mcp-gateway"
+listen_addr = "127.0.0.1:8080"
+allowed_origins = ["https://client.example"]
+
+[[backends]]
+name = "business"
+transport = "streamable-http"
+endpoint = "https://backend.example/mcp"
+# Empty tools means discover all backend tools.
+tools = []
+headers = { Authorization = "${BUSINESS_BACKEND_AUTHORIZATION}" }
+max_connections = 10
+timeout_ms = 30000
+
+[auth]
+enabled = true
+# Optional API Key transition path:
+# api_key_env = ["MCP_GATEWAY_API_KEY"]
+
+[auth.oauth]
+issuer = "https://auth.example"
+audience = "https://gateway.example/mcp"
+resource_url = "https://gateway.example/mcp"
+jwks_url = "https://auth.example/.well-known/jwks.json"
+required_scopes = ["mcp:read"]
+
+[auth.oauth.tool_scopes]
+update_profile = ["mcp:write"]
+
+[cache]
+enabled = false

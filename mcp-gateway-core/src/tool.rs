@@ -12,6 +12,8 @@ pub struct Tool {
     /// JSON Schema describing the tool's input parameters.
     #[serde(rename = "inputSchema")]
     pub input_schema: Value,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Request to invoke a tool, sent via `tools/call`.
@@ -28,6 +30,10 @@ pub struct ToolCallResult {
     pub content: Vec<Content>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "isError")]
     pub is_error: Option<bool>,
+    #[serde(rename = "structuredContent", skip_serializing_if = "Option::is_none")]
+    pub structured_content: Option<Value>,
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, Value>,
 }
 
 /// Content types returned by a tool.
@@ -47,6 +53,19 @@ pub enum Content {
         mime_type: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         annotations: Option<Value>,
+    },
+    #[serde(rename = "audio")]
+    AudioContent {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(flatten)]
+        extra: serde_json::Map<String, Value>,
     },
     #[serde(rename = "resource")]
     ResourceContent {
@@ -78,6 +97,8 @@ impl ToolCallResult {
                 annotations: None,
             }],
             is_error: None,
+            structured_content: None,
+            extra: Default::default(),
         }
     }
 
@@ -88,6 +109,8 @@ impl ToolCallResult {
                 annotations: None,
             }],
             is_error: Some(true),
+            structured_content: None,
+            extra: Default::default(),
         }
     }
 }
@@ -98,6 +121,7 @@ impl Tool {
             name: name.into(),
             description: None,
             input_schema,
+            extra: Default::default(),
         }
     }
 
@@ -133,5 +157,15 @@ mod tests {
         let tool: Tool = serde_json::from_str(json).unwrap();
         assert_eq!(tool.name, "get_weather");
         assert_eq!(tool.description.unwrap(), "Get current weather");
+    }
+}
+#[cfg(test)]
+mod structured_tests {
+    use super::*;
+    #[test]
+    fn structured_result_and_metadata_survive_roundtrip() {
+        let raw = serde_json::json!({"content":[], "structuredContent":{"count":32}, "_meta":{"trace":"a"}});
+        let result: ToolCallResult = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(serde_json::to_value(result).unwrap(), raw);
     }
 }

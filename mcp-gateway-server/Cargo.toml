@@ -7,6 +7,7 @@ authors.workspace = true
 description = "MCP Gateway server - HTTP server, routing, proxy, caching, auth"
 
 [dependencies]
+mcp-gateway-sdk = { path = "../mcp-gateway-sdk" }
 mcp-gateway-core = { path = "../mcp-gateway-core" }
 tokio.workspace = true
 serde.workspace = true
@@ -27,7 +28,7 @@ axum = "0.8"
 # HTTP client (for backend connections)
 reqwest = { version = "0.13", features = ["json", "stream"] }
 # Middleware
-tower = "0.5"
+tower = { version = "0.5", features = ["util"] }
 # Cache
 moka = { version = "0.12", features = ["future"] }
 # Concurrent data structures
@@ -37,3 +38,11 @@ jsonschema = "0.47"
 # SSE streaming
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = "0.3"
+sha2 = "0.10"
+
+jsonwebtoken = { version = "10", features = ["rust_crypto"] }
+
+[dev-dependencies]
+rsa = { version = "0.9", features = ["pem"] }
+rand = "0.8"
+base64 = "0.22"

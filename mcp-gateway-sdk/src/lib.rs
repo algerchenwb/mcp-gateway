@@ -29,5 +29,5 @@ pub mod transport;
 
 pub use client::GatewayClient;
 pub use mcp_gateway_core::tool::Tool;
-pub use mcp_gateway_core::types::{InitializeResult, ServerCapabilities};
 pub use mcp_gateway_core::tool::ToolCallResult;
+pub use mcp_gateway_core::types::{InitializeResult, ServerCapabilities};

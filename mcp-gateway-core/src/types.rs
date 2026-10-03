@@ -69,13 +69,62 @@ pub struct JsonRpcNotification {
 }
 
 /// All four JSON-RPC 2.0 message types.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum JsonRpcMessage {
     Request(JsonRpcRequest),
     Response(JsonRpcResponse),
     Error(JsonRpcErrorResponse),
     Notification(JsonRpcNotification),
+}
+
+impl<'de> Deserialize<'de> for JsonRpcMessage {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let value = Value::deserialize(deserializer)?;
+        let object = value
+            .as_object()
+            .ok_or_else(|| D::Error::custom("message must be an object"))?;
+        if object.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(D::Error::custom("jsonrpc must be 2.0"));
+        }
+        let has_id = object.contains_key("id");
+        let method = object.contains_key("method");
+        let result = object.contains_key("result");
+        let error = object.contains_key("error");
+        if method && !result && !error {
+            if !object.get("method").is_some_and(Value::is_string) {
+                return Err(D::Error::custom("method must be a string"));
+            }
+            if let Some(params) = object.get("params") {
+                if !params.is_object() && !params.is_array() {
+                    return Err(D::Error::custom("params must be an object or array"));
+                }
+            }
+            return if has_id {
+                serde_json::from_value(value)
+                    .map(Self::Request)
+                    .map_err(D::Error::custom)
+            } else {
+                serde_json::from_value(value)
+                    .map(Self::Notification)
+                    .map_err(D::Error::custom)
+            };
+        }
+        if !method && has_id && result != error {
+            return if error {
+                serde_json::from_value(value)
+                    .map(Self::Error)
+                    .map_err(D::Error::custom)
+            } else {
+                let mut response: JsonRpcResponse =
+                    serde_json::from_value(value.clone()).map_err(D::Error::custom)?;
+                response.result = Some(value["result"].clone());
+                Ok(Self::Response(response))
+            };
+        }
+        Err(D::Error::custom("invalid JSON-RPC message shape"))
+    }
 }
 
 impl JsonRpcMessage {
@@ -268,11 +317,7 @@ mod tests {
 
     #[test]
     fn test_serialize_request() {
-        let req = JsonRpcRequest::new(
-            "tools/list",
-            None,
-            RequestId::Number(1),
-        );
+        let req = JsonRpcRequest::new("tools/list", None, RequestId::Number(1));
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"method\":\"tools/list\""));
         assert!(json.contains("\"jsonrpc\":\"2.0\""));
@@ -290,5 +335,39 @@ mod tests {
         let json = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let msg: JsonRpcMessage = serde_json::from_str(json).unwrap();
         assert!(matches!(msg, JsonRpcMessage::Notification(_)));
+    }
+}
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn errors_are_not_success_responses() {
+        let msg: JsonRpcMessage = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0", "id":1, "error":{"code":-32602,"message":"bad args","data":{"field":"city"}}
+        })).unwrap();
+        let JsonRpcMessage::Error(error) = msg else {
+            panic!("expected error")
+        };
+        assert_eq!(error.error.code, -32602);
+        assert_eq!(error.error.data.unwrap()["field"], "city");
+    }
+    #[test]
+    fn null_result_is_a_valid_success() {
+        let msg: JsonRpcMessage =
+            serde_json::from_str(r#"{"jsonrpc":"2.0","id":1,"result":null}"#).unwrap();
+        let JsonRpcMessage::Response(response) = msg else {
+            panic!("expected response")
+        };
+        assert_eq!(response.result, Some(Value::Null));
+    }
+    #[test]
+    fn malformed_messages_are_rejected() {
+        for raw in [
+            r#"{"jsonrpc":"1.0","id":1,"result":{}}"#,
+            r#"{"jsonrpc":"2.0","id":1}"#,
+            r#"{"jsonrpc":"2.0","id":1,"result":{},"error":{"code":1,"message":"x"}}"#,
+        ] {
+            assert!(serde_json::from_str::<JsonRpcMessage>(raw).is_err());
+        }
     }
 }

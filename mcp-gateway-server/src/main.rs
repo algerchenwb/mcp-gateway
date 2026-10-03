@@ -45,8 +45,8 @@ async fn main() {
 }
 
 fn setup_logging(config: &GatewayConfig) {
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.logging.level));
 
     let builder = tracing_subscriber::fmt()
         .with_env_filter(env_filter)
@@ -79,10 +79,21 @@ fn validate_config(config_path: PathBuf) {
                         b.tools
                     );
                 }
-                println!("   Auth: {}", if config.auth.enabled { "enabled" } else { "disabled" });
+                println!(
+                    "   Auth: {}",
+                    if config.auth.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
                 println!(
                     "   Cache: {} (max={}, ttl={}s)",
-                    if config.cache.enabled { "enabled" } else { "disabled" },
+                    if config.cache.enabled {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
                     config.cache.max_capacity,
                     config.cache.ttl_seconds
                 );
@@ -106,7 +117,10 @@ async fn run_gateway(config_path: PathBuf) {
     let config = match GatewayConfig::from_file(&config_path) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("Failed to load configuration from {}: {e}", config_path.display());
+            eprintln!(
+                "Failed to load configuration from {}: {e}",
+                config_path.display()
+            );
             std::process::exit(1);
         }
     };
@@ -128,5 +142,8 @@ async fn run_gateway(config_path: PathBuf) {
         "Starting MCP Gateway"
     );
 
-    server::run(config).await;
+    if let Err(error) = server::run_file(config, config_path).await {
+        tracing::error!(error=%error,"gateway stopped with an error");
+        std::process::exit(1);
+    }
 }

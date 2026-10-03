@@ -8,3 +8,4 @@ pub use error::McpError;
 pub use tool::{Content, Tool, ToolCallRequest, ToolCallResult};
 pub use transport::{McpTransport, TransportType};
 pub use types::*;
+pub mod sse;

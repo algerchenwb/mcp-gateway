@@ -11,6 +11,7 @@ name = "mcp-gateway-stdio"
 path = "src/main.rs"
 
 [dependencies]
+mcp-gateway-sdk = { path = "../mcp-gateway-sdk" }
 mcp-gateway-core = { path = "../mcp-gateway-core" }
 tokio.workspace = true
 serde.workspace = true
@@ -20,3 +21,5 @@ tracing-subscriber.workspace = true
 reqwest = { version = "0.13", features = ["json"] }
 clap = { version = "4", features = ["derive"] }
 tokio-util = { version = "0.7", features = ["codec"] }
+[dev-dependencies]
+axum = "0.8"
