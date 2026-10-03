@@ -28,6 +28,14 @@ pub struct GatewaySettings {
     /// Browser origins explicitly allowed to access MCP endpoints.
     #[serde(default)]
     pub allowed_origins: Vec<String>,
+    #[serde(default = "default_inflight")]
+    pub max_inflight_requests: usize,
+    #[serde(default = "default_sse_sessions")]
+    pub max_sse_sessions: usize,
+    #[serde(default = "default_sse_ttl")]
+    pub sse_ttl_seconds: u64,
+    #[serde(default = "default_sse_queue")]
+    pub sse_queue_capacity: usize,
 }
 
 impl Default for GatewaySettings {
@@ -36,8 +44,25 @@ impl Default for GatewaySettings {
             name: default_gateway_name(),
             listen_addr: default_listen_addr(),
             allowed_origins: Vec::new(),
+            max_inflight_requests: default_inflight(),
+            max_sse_sessions: default_sse_sessions(),
+            sse_ttl_seconds: default_sse_ttl(),
+            sse_queue_capacity: default_sse_queue(),
         }
     }
+}
+
+fn default_inflight() -> usize {
+    256
+}
+fn default_sse_sessions() -> usize {
+    1024
+}
+fn default_sse_ttl() -> u64 {
+    1800
+}
+fn default_sse_queue() -> usize {
+    32
 }
 
 fn default_gateway_name() -> String {
@@ -250,6 +275,13 @@ impl GatewayConfig {
             errors.push("gateway.name must not be empty".to_string());
         }
 
+        if self.gateway.max_inflight_requests == 0
+            || self.gateway.max_sse_sessions == 0
+            || self.gateway.sse_ttl_seconds == 0
+            || self.gateway.sse_queue_capacity == 0
+        {
+            errors.push("gateway concurrency, SSE limits and TTL must be positive".into());
+        }
         if self.backends.is_empty() {
             errors.push("at least one backend must be configured".to_string());
         }

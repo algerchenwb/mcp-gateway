@@ -56,7 +56,10 @@ pub async fn process_message_scoped(
 ) -> Result<Json<Value>, Json<Value>> {
     match message {
         JsonRpcMessage::Request(req) => {
-            let resp = handle_request(state, req, scope).await;
+            let resp = handle_request(state.clone(), req, scope).await;
+            if matches!(resp, JsonRpcMessage::Error(_)) {
+                state.metrics.record_rpc_error();
+            }
             let json = serde_json::to_value(&resp).unwrap_or_else(|_| {
                 json_error_value(
                     RequestId::Null,
@@ -261,12 +264,22 @@ async fn handle_tools_call(
         None
     };
 
-    match forward::forward_tool_call(&target, tool_name, Some(arguments), cache, scope).await {
+    match forward::forward_tool_call(
+        &target,
+        tool_name,
+        Some(arguments),
+        cache,
+        scope,
+        &state.metrics,
+    )
+    .await
+    {
         Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::new(
             id,
             serde_json::to_value(result).unwrap_or_default(),
         )),
         Err(e) => {
+            state.metrics.record_tool_error();
             tracing::error!(
                 tool = tool_name,
                 error = %e,

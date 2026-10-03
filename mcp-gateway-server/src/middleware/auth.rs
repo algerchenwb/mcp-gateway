@@ -8,7 +8,7 @@ use axum::{
 };
 
 pub async fn auth_layer(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    if req.uri().path() == "/health" {
+    if matches!(req.uri().path(), "/health" | "/ready") {
         return next.run(req).await;
     }
     if req.uri().path().starts_with("/mcp") {

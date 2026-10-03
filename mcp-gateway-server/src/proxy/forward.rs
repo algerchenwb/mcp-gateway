@@ -60,6 +60,7 @@ pub async fn forward_tool_call(
     arguments: Option<serde_json::Value>,
     cache: Option<&L1Cache>,
     scope: &str,
+    metrics: &crate::middleware::metrics::Metrics,
 ) -> McpResult<ToolCallResult> {
     let args = arguments.unwrap_or_else(|| serde_json::json!({}));
     let scope = format!(
@@ -79,9 +80,14 @@ pub async fn forward_tool_call(
     if let Some(cache) = cache {
         let key = cache_key(&target.backend, &scope, tool_name, &args);
         if let Some(cached) = cache.get(&key).await {
+            metrics.record_cache(true);
             tracing::debug!(tool = tool_name, backend = target.backend.name, "cache hit");
             return Ok(cached);
         }
+    }
+
+    if cache.is_some() {
+        metrics.record_cache(false);
     }
 
     // 2. Build the JSON-RPC request
@@ -145,6 +151,10 @@ pub async fn forward_tool_call(
             ));
         }
     };
+
+    if result.is_error == Some(true) {
+        metrics.record_tool_error();
+    }
 
     // 5. Store in cache
     if let Some(cache) = cache {

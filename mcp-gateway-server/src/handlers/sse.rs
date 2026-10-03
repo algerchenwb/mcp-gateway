@@ -30,17 +30,15 @@ pub struct SseSessions {
     ttl: Duration,
     queue_capacity: usize,
 }
-impl Default for SseSessions {
-    fn default() -> Self {
+impl SseSessions {
+    pub fn new(max_sessions: usize, ttl_seconds: u64, queue_capacity: usize) -> Self {
         Self {
             sessions: DashMap::new(),
-            slots: Arc::new(Semaphore::new(1024)),
-            ttl: Duration::from_secs(1800),
-            queue_capacity: 32,
+            slots: Arc::new(Semaphore::new(max_sessions)),
+            ttl: Duration::from_secs(ttl_seconds),
+            queue_capacity,
         }
     }
-}
-impl SseSessions {
     pub fn close_all(&self) {
         self.slots.close();
         self.sessions.clear();
@@ -109,6 +107,9 @@ pub async fn handle_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> StatusCode {
+    let Ok(inflight) = state.inflight.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS;
+    };
     let scope = super::json_rpc::credential_scope(&state, &headers);
     let sender = {
         let Some(session) = state.sse.sessions.get(&id) else {
@@ -150,6 +151,7 @@ pub async fn handle_message(
         Err(_) => return StatusCode::TOO_MANY_REQUESTS,
     };
     tokio::spawn(async move {
+        let _inflight = inflight;
         let response = super::json_rpc::process_message_scoped(state, message, &scope).await;
         let value = match response {
             Ok(value) | Err(value) => value.0,

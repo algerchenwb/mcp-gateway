@@ -10,6 +10,9 @@ use axum::{
 use mcp_gateway_core::types::{error_codes, JsonRpcErrorResponse, JsonRpcMessage, RequestId};
 
 pub async fn handle(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let Ok(_permit) = state.inflight.clone().try_acquire_owned() else {
+        return StatusCode::TOO_MANY_REQUESTS.into_response();
+    };
     if let Some(version) = headers.get("MCP-Protocol-Version") {
         if !version
             .to_str()
