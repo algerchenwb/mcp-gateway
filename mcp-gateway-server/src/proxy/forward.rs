@@ -28,6 +28,7 @@ pub fn cache_key(
         backend.command,
         backend.args,
         backend.env,
+        backend.headers,
         scope,
         tool_name,
         canonical(arguments)
@@ -75,6 +76,18 @@ pub async fn forward_tool_call(
             .iter()
             .any(|name| name == tool_name)
     });
+
+    let _flight = match cache {
+        Some(cache) => Some(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(target.backend.timeout_ms),
+                cache.lock_key(&cache_key(&target.backend, &scope, tool_name, &args)),
+            )
+            .await
+            .map_err(|_| McpError::BackendTimeout("cache wait deadline exceeded".into()))?,
+        ),
+        None => None,
+    };
 
     // 1. Check cache
     if let Some(cache) = cache {

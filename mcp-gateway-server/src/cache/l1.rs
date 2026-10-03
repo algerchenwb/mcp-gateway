@@ -6,6 +6,9 @@ pub struct L1Cache {
     inner: moka::future::Cache<String, ToolCallResult>,
     max_entries: u64,
     max_result_bytes: usize,
+    flights: std::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Weak<tokio::sync::Mutex<()>>>,
+    >,
 }
 impl L1Cache {
     pub fn new(max_capacity: u64, ttl: Duration) -> Self {
@@ -28,7 +31,24 @@ impl L1Cache {
                 .build(),
             max_entries,
             max_result_bytes,
+            flights: Default::default(),
         }
+    }
+    /// Keep only weak references so unique cache misses cannot grow a permanent lock table.
+    pub async fn lock_key(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let mutex = {
+            let mut flights = self.flights.lock().expect("cache lock table poisoned");
+            flights.retain(|_, value| value.strong_count() > 0);
+            match flights.get(key).and_then(std::sync::Weak::upgrade) {
+                Some(mutex) => mutex,
+                None => {
+                    let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+                    flights.insert(key.to_owned(), std::sync::Arc::downgrade(&mutex));
+                    mutex
+                }
+            }
+        };
+        mutex.lock_owned().await
     }
     pub async fn get(&self, key: &str) -> Option<ToolCallResult> {
         self.inner.get(key).await

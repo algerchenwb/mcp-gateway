@@ -149,6 +149,13 @@ async fn gateway_discovers_real_schema_validates_arguments_and_caches_opted_in_t
         assert_eq!(result.structured_content.unwrap()["value"], "hello");
     }
     assert_eq!(count.load(Ordering::SeqCst), 11);
+    let results = futures_util::future::join_all(
+        (0..20).map(|_| client.call_tool("echo", Some(serde_json::json!({"value":"concurrent"})))),
+    )
+    .await;
+    assert!(results.into_iter().all(|result| result.is_ok()));
+    assert_eq!(count.load(Ordering::SeqCst), 21);
+    assert_eq!(state.metrics.snapshot().cache_hits, 20);
     state.backends.shutdown().await;
     gateway.abort();
     backend.abort();
