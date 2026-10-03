@@ -80,10 +80,18 @@ impl BackendClient {
                 .await
                 .map_err(|_| McpError::Transport("backend is shutting down".into()))?;
             let connection = self.ensure_connection().await?;
-            connection
-                .exchange(message)
-                .await?
-                .ok_or_else(|| McpError::Transport("expected backend response".into()))
+            let mut cancellation = BackendCancellation {
+                connection: connection.clone(),
+                id: match &message {
+                    JsonRpcMessage::Request(request) if request.method == "tools/call" => {
+                        Some(request.id.clone())
+                    }
+                    _ => None,
+                },
+            };
+            let response = connection.exchange(message).await;
+            cancellation.id = None;
+            response?.ok_or_else(|| McpError::Transport("expected backend response".into()))
         })
         .await;
         match result {
@@ -160,6 +168,32 @@ impl BackendClient {
     pub async fn shutdown(&self) {
         self.permits.close();
         self.invalidate().await;
+    }
+}
+
+// Keep the exact connection alive until a best-effort cancellation is sent.
+// Dropping a client future (including deadline expiry) must not replay the call.
+struct BackendCancellation {
+    connection: Arc<Connection>,
+    id: Option<RequestId>,
+}
+impl Drop for BackendCancellation {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            let connection = self.connection.clone();
+            tokio::spawn(async move {
+                let notification = JsonRpcMessage::Notification(JsonRpcNotification {
+                    jsonrpc: "2.0".into(),
+                    method: "notifications/cancelled".into(),
+                    params: Some(
+                        serde_json::json!({"requestId":id,"reason":"gateway request cancelled or deadline expired"}),
+                    ),
+                });
+                let _ =
+                    tokio::time::timeout(Duration::from_secs(1), connection.exchange(notification))
+                        .await;
+            });
+        }
     }
 }
 

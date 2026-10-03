@@ -127,6 +127,7 @@ pub async fn handle_message(
         }
         session.sender.clone()
     };
+    let scope = format!("{scope}:sse:{id}");
     if !headers
         .get("content-type")
         .and_then(|v| v.to_str().ok())

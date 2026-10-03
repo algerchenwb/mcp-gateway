@@ -95,8 +95,30 @@ pub async fn admission_layer(
     next: Next,
 ) -> Response {
     if req.method() == axum::http::Method::POST && req.uri().path().starts_with("/mcp") {
-        let Ok(permit) = state.inflight.clone().try_acquire_owned() else {
-            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        let permit = match state.inflight.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                // Cancellation must remain available when ordinary requests exhaust capacity.
+                let Ok(permit) = state.control.clone().try_acquire_owned() else {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                };
+                let (parts, body) = req.into_parts();
+                let Ok(Ok(bytes)) = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    axum::body::to_bytes(body, 4096),
+                )
+                .await
+                else {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                };
+                let is_cancel = matches!(serde_json::from_slice::<mcp_gateway_core::types::JsonRpcMessage>(&bytes),
+                    Ok(mcp_gateway_core::types::JsonRpcMessage::Notification(n)) if n.method == "notifications/cancelled");
+                if !is_cancel {
+                    return StatusCode::TOO_MANY_REQUESTS.into_response();
+                }
+                req = Request::from_parts(parts, axum::body::Body::from(bytes));
+                permit
+            }
         };
         req.extensions_mut()
             .insert(AdmissionPermit(std::sync::Arc::new(permit)));

@@ -135,4 +135,4 @@ cargo test --workspace --locked
 
 测试覆盖 HTTP/SSE 会话头、错误响应识别、通知语义、真实工具发现、Schema 校验、stdio 进程复用/超时、SSE 身份隔离、缓存合并、指标和 OAuth 校验。stdio 集成测试需要 Python 3。
 
-目前聚焦工具聚合：resources、prompts、sampling、elicitation、进度转发、完整取消传播、SSE 断线恢复、多实例会话共享和配置热更新尚未实现。`notifications/cancelled` 当前只记录日志，不保证停止后端操作。后端通知不会向下游客户端转发，因此不宣告相关能力。所有后端必须成功发现目录，tools/list 才会返回，后端故障时不会静默提供不完整目录。
+目前聚焦工具聚合：resources、prompts、sampling、elicitation、进度转发、SSE 断线恢复、多实例会话共享和配置热更新尚未实现。`notifications/cancelled` 按身份和请求 ID 取消在途调用，旧 SSE 额外按会话隔离。initialize 不接受取消；同一身份的在途 ID 不可重复。网关取消等待并向原后端连接发送取消通知（最多等待 1 秒），超时也触发该通知；后端是否停止操作取决于其实现，取消不能撤销已产生的副作用。容量耗尽时保留 16 个控制请求槽，取消消息限制为 4 KiB、读取限时 2 秒。无鉴权 HTTP 使用共享 public 身份，多客户端应使用独立凭据和不重复的 ID。后端通知不会向下游客户端转发，因此不宣告相关能力。所有后端必须成功发现目录，tools/list 才会返回，后端故障时不会静默提供不完整目录。

@@ -64,7 +64,30 @@ pub async fn process_message_authorized(
 ) -> Result<Json<Value>, Json<Value>> {
     match message {
         JsonRpcMessage::Request(req) => {
-            let resp = handle_request(state.clone(), req, scope, principal.as_ref()).await;
+            let id = req.id.clone();
+            let resp = if req.method == "initialize" {
+                handle_request(state.clone(), req, scope, principal.as_ref()).await
+            } else if let Some((_guard, registration)) = state.requests.register(scope, id.clone())
+            {
+                futures_util::future::Abortable::new(
+                    handle_request(state.clone(), req, scope, principal.as_ref()),
+                    registration,
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                        id,
+                        -32800,
+                        "request cancelled",
+                    ))
+                })
+            } else {
+                JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                    id,
+                    error_codes::INVALID_REQUEST,
+                    "request ID already in flight for this identity",
+                ))
+            };
             if matches!(resp, JsonRpcMessage::Error(_)) {
                 state.metrics.record_rpc_error();
             }
@@ -78,7 +101,7 @@ pub async fn process_message_authorized(
             Ok(Json(json))
         }
         JsonRpcMessage::Notification(notif) => {
-            handle_notification(state, notif).await;
+            handle_notification(state, notif, scope).await;
             Ok(Json(serde_json::json!({})))
         }
         JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => Err(Json(json_error_value(
@@ -131,8 +154,9 @@ async fn handle_request(
 
 /// Handle a JSON-RPC notification.
 async fn handle_notification(
-    _state: AppState,
+    state: AppState,
     notif: mcp_gateway_core::types::JsonRpcNotification,
+    scope: &str,
 ) {
     let method = notif.method.as_str();
     tracing::debug!(method = method, "received notification");
@@ -142,7 +166,13 @@ async fn handle_notification(
             tracing::info!("client initialized successfully");
         }
         "notifications/cancelled" => {
-            tracing::debug!("client cancelled request");
+            if let Some(id) = notif.params.as_ref().and_then(|p| p.get("requestId")) {
+                if let Ok(id) = serde_json::from_value::<RequestId>(id.clone()) {
+                    if id != RequestId::Null {
+                        state.requests.cancel(scope, id);
+                    }
+                }
+            }
         }
         _ => {
             tracing::debug!(method = method, "unknown notification");

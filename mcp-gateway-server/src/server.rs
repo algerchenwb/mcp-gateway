@@ -12,6 +12,8 @@ use crate::middleware::{auth, logging, metrics};
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<GatewayConfig>,
+    pub requests: Arc<crate::handlers::cancellation::Requests>,
+    pub control: Arc<tokio::sync::Semaphore>,
     pub cache: Arc<L1Cache>,
     pub metrics: Arc<metrics::Metrics>,
     pub backends: Arc<crate::proxy::registry::BackendRegistry>,
@@ -43,6 +45,8 @@ impl AppState {
                 config.gateway.sse_ttl_seconds,
                 config.gateway.sse_queue_capacity,
             )),
+            requests: Arc::default(),
+            control: Arc::new(tokio::sync::Semaphore::new(16)),
             config: Arc::new(config),
             cache,
             backends,
