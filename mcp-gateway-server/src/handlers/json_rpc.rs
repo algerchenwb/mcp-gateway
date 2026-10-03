@@ -8,12 +8,12 @@ use axum::http::HeaderMap;
 use axum::Json;
 use serde_json::Value;
 
+use mcp_gateway_core::tool::Tool;
 use mcp_gateway_core::types::{
-    error_codes, InitializeRequest, InitializeResult, Implementation, JsonRpcErrorResponse,
+    error_codes, Implementation, InitializeRequest, InitializeResult, JsonRpcErrorResponse,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, ServerCapabilities,
     ToolsCapability,
 };
-use mcp_gateway_core::tool::Tool;
 
 use crate::proxy::forward;
 use crate::router::static_route::build_engine;
@@ -71,7 +71,11 @@ pub async fn process_message(
         JsonRpcMessage::Request(req) => {
             let resp = handle_request(state, req).await;
             let json = serde_json::to_value(&resp).unwrap_or_else(|_| {
-                json_error_value(RequestId::Null, error_codes::INTERNAL_ERROR, "serialization error")
+                json_error_value(
+                    RequestId::Null,
+                    error_codes::INTERNAL_ERROR,
+                    "serialization error",
+                )
             });
             Ok(Json(json))
         }
@@ -79,13 +83,11 @@ pub async fn process_message(
             handle_notification(state, notif).await;
             Ok(Json(serde_json::json!({})))
         }
-        JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => {
-            Err(Json(json_error_value(
-                RequestId::Null,
-                error_codes::INVALID_REQUEST,
-                "gateway does not accept responses from clients",
-            )))
-        }
+        JsonRpcMessage::Response(_) | JsonRpcMessage::Error(_) => Err(Json(json_error_value(
+            RequestId::Null,
+            error_codes::INVALID_REQUEST,
+            "gateway does not accept responses from clients",
+        ))),
     }
 }
 
@@ -107,7 +109,10 @@ async fn handle_request(state: AppState, req: JsonRpcRequest) -> JsonRpcMessage 
 }
 
 /// Handle a JSON-RPC notification.
-async fn handle_notification(_state: AppState, notif: mcp_gateway_core::types::JsonRpcNotification) {
+async fn handle_notification(
+    _state: AppState,
+    notif: mcp_gateway_core::types::JsonRpcNotification,
+) {
     let method = notif.method.as_str();
     tracing::debug!(method = method, "received notification");
 
@@ -163,9 +168,7 @@ fn handle_initialize(id: RequestId, params: Option<Value>) -> JsonRpcMessage {
             name: "mcp-gateway".to_string(),
             version: env!("CARGO_PKG_VERSION").to_string(),
         },
-        instructions: Some(
-            "MCP Gateway — route tool calls to configured backends".to_string(),
-        ),
+        instructions: Some("MCP Gateway — route tool calls to configured backends".to_string()),
     };
 
     JsonRpcMessage::Response(JsonRpcResponse::new(
@@ -183,6 +186,7 @@ fn handle_tools_list(state: AppState, id: RequestId) -> JsonRpcMessage {
         .map(|(name, backend)| Tool {
             name,
             description: Some(format!("Tool from backend '{backend}'")),
+            extra: Default::default(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {}
@@ -245,12 +249,10 @@ async fn handle_tools_call(
     };
 
     match forward::forward_tool_call(&target, tool_name, arguments, cache).await {
-        Ok(result) => {
-            JsonRpcMessage::Response(JsonRpcResponse::new(
-                id,
-                serde_json::to_value(result).unwrap_or_default(),
-            ))
-        }
+        Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::new(
+            id,
+            serde_json::to_value(result).unwrap_or_default(),
+        )),
         Err(e) => {
             tracing::error!(
                 tool = tool_name,
@@ -313,11 +315,14 @@ mod tests {
 
     #[test]
     fn test_initialize() {
-        let result = handle_initialize(RequestId::Number(1), Some(serde_json::json!({
-            "protocolVersion": "2025-06-18",
-            "capabilities": {},
-            "clientInfo": { "name": "test", "version": "1.0" }
-        })));
+        let result = handle_initialize(
+            RequestId::Number(1),
+            Some(serde_json::json!({
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": { "name": "test", "version": "1.0" }
+            })),
+        );
 
         match result {
             JsonRpcMessage::Response(resp) => {
