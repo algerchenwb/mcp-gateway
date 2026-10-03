@@ -23,7 +23,7 @@ pub struct ToolEntry {
     pub client: Arc<BackendClient>,
     pub validator: Arc<jsonschema::Validator>,
 }
-pub struct BackendRegistry {
+struct Generation {
     backends: Vec<(Arc<BackendConfig>, Arc<BackendClient>)>,
     catalog: Mutex<Option<(Instant, HashMap<String, ToolPool>)>>,
 }
@@ -58,7 +58,7 @@ impl jsonschema::Retrieve for NoNetwork {
         Err("external JSON Schema references are disabled".into())
     }
 }
-impl BackendRegistry {
+impl Generation {
     pub fn new(config: &GatewayConfig) -> Self {
         Self {
             backends: config
@@ -209,5 +209,41 @@ impl BackendRegistry {
         for (_, client) in &self.backends {
             client.shutdown().await;
         }
+    }
+}
+
+/// An atomically replaced catalog generation. Tool entries hold their original
+/// clients, allowing in-flight requests to finish when a generation is retired.
+pub struct BackendRegistry {
+    current: std::sync::RwLock<Arc<Generation>>,
+    reload: Mutex<()>,
+}
+impl BackendRegistry {
+    pub fn new(config: &GatewayConfig) -> Self {
+        Self {
+            current: std::sync::RwLock::new(Arc::new(Generation::new(config))),
+            reload: Mutex::new(()),
+        }
+    }
+    fn snapshot(&self) -> Arc<Generation> {
+        self.current.read().expect("registry lock poisoned").clone()
+    }
+    pub async fn tools(&self) -> McpResult<Vec<ToolEntry>> {
+        self.snapshot().tools().await
+    }
+    pub async fn resolve(&self, name: &str) -> McpResult<Option<ToolEntry>> {
+        self.snapshot().resolve(name).await
+    }
+    pub async fn reload(&self, config: &GatewayConfig) -> McpResult<()> {
+        let _guard = self.reload.lock().await;
+        let candidate = Arc::new(Generation::new(config));
+        // Warm every connection and validate all replica definitions before publication.
+        candidate.tools().await?;
+        *self.current.write().expect("registry lock poisoned") = candidate;
+        Ok(())
+    }
+    pub async fn shutdown(&self) {
+        let _guard = self.reload.lock().await;
+        self.snapshot().shutdown().await;
     }
 }

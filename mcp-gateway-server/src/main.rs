@@ -142,7 +142,7 @@ async fn run_gateway(config_path: PathBuf) {
         "Starting MCP Gateway"
     );
 
-    if let Err(error) = server::run(config).await {
+    if let Err(error) = server::run_file(config, config_path).await {
         tracing::error!(error=%error,"gateway stopped with an error");
         std::process::exit(1);
     }

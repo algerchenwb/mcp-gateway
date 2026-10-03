@@ -53,6 +53,37 @@ impl AppState {
             metrics: Arc::default(),
         }
     }
+    /// Reload only backend settings; security and listener settings remain fixed.
+    pub async fn reload_config(
+        &self,
+        config: GatewayConfig,
+    ) -> mcp_gateway_core::error::McpResult<()> {
+        use mcp_gateway_core::error::McpError;
+        config
+            .validate()
+            .map_err(|errors| McpError::Config(errors.join("; ")))?;
+        let mut original = serde_json::to_value(self.config.as_ref())?;
+        let mut candidate = serde_json::to_value(&config)?;
+        original
+            .as_object_mut()
+            .expect("config object")
+            .remove("backends");
+        candidate
+            .as_object_mut()
+            .expect("config object")
+            .remove("backends");
+        if original != candidate {
+            return Err(McpError::Config(
+                "only backend settings can be reloaded; other changes require a restart".into(),
+            ));
+        }
+        tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            self.backends.reload(&config),
+        )
+        .await
+        .map_err(|_| McpError::Config("backend reload exceeded 30 second deadline".into()))?
+    }
 }
 
 /// Build the axum router with all routes and middleware.
@@ -110,6 +141,20 @@ pub fn build_router(state: AppState) -> Router {
 
 /// Start the gateway server.
 pub async fn run(config: GatewayConfig) -> mcp_gateway_core::error::McpResult<()> {
+    run_with_reload(config, None).await
+}
+
+pub async fn run_file(
+    config: GatewayConfig,
+    path: std::path::PathBuf,
+) -> mcp_gateway_core::error::McpResult<()> {
+    run_with_reload(config, Some(path)).await
+}
+
+async fn run_with_reload(
+    config: GatewayConfig,
+    path: Option<std::path::PathBuf>,
+) -> mcp_gateway_core::error::McpResult<()> {
     let listen_addr = config.gateway.listen_addr.clone();
 
     let state = AppState::new(config);
@@ -131,6 +176,40 @@ pub async fn run(config: GatewayConfig) -> mcp_gateway_core::error::McpResult<()
         })
         .into_future();
     tokio::pin!(server);
+    // SIGHUP reloads are serialized and never block the termination signal.
+    let reload_state = state.clone();
+    let reload_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        if let Some(path) = path {
+            if let Ok(mut signal) =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+            {
+                while signal.recv().await.is_some() {
+                    let load_path = path.clone();
+                    let candidate = tokio::task::spawn_blocking(move || {
+                        GatewayConfig::from_file(&load_path).map_err(|_| ())
+                    })
+                    .await;
+                    match candidate {
+                        Ok(Ok(config)) => match reload_state.reload_config(config).await {
+                            Ok(()) => tracing::info!("backend configuration reloaded"),
+                            Err(_) => tracing::warn!("backend reload rejected; previous configuration retained"),
+                        },
+                        _ => tracing::warn!("backend configuration could not be loaded; previous configuration retained"),
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (path, reload_state);
+    });
+    struct AbortOnDrop(tokio::task::JoinHandle<()>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let reload_task = AbortOnDrop(reload_task);
     tokio::select! {
         result=&mut server => { result?; },
         _=shutdown_signal() => {
@@ -143,6 +222,7 @@ pub async fn run(config: GatewayConfig) -> mcp_gateway_core::error::McpResult<()
             }
         }
     }
+    drop(reload_task);
     state.backends.shutdown().await;
     Ok(())
 }
