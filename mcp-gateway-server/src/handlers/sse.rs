@@ -106,13 +106,11 @@ pub async fn handle(
 pub async fn handle_message(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    axum::Extension(admission): axum::Extension<crate::middleware::auth::AdmissionPermit>,
     headers: HeaderMap,
     principal: Option<axum::Extension<crate::auth::oauth::Principal>>,
     body: Bytes,
 ) -> StatusCode {
-    let Ok(inflight) = state.inflight.clone().try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS;
-    };
     let principal = principal.map(|p| p.0);
     let scope = super::json_rpc::authorized_scope(&state, &headers, principal.as_ref());
     let sender = {
@@ -156,7 +154,7 @@ pub async fn handle_message(
         Err(_) => return StatusCode::TOO_MANY_REQUESTS,
     };
     tokio::spawn(async move {
-        let _inflight = inflight;
+        let _inflight = admission.0;
         let response =
             super::json_rpc::process_message_authorized(state, message, &scope, principal).await;
         let value = match response {

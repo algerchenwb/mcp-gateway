@@ -54,17 +54,11 @@ pub enum RouteStrategy {
         embedding_model: String,
     },
     /// Route based on user-defined rules (Phase 1 default).
-    RuleBased {
-        rules: Vec<RouteRule>,
-    },
+    RuleBased { rules: Vec<RouteRule> },
     /// Distribute across multiple instances.
-    LoadBalanced {
-        strategy: LBStrategy,
-    },
+    LoadBalanced { strategy: LBStrategy },
     /// Distribute to multiple models.
-    MultiModel {
-        models: Vec<ModelConfig>,
-    },
+    MultiModel { models: Vec<ModelConfig> },
     /// Try backends in order, falling back on failure.
     Cascade {
         /// Backend names in fallback order.
@@ -87,10 +81,7 @@ pub struct RouteEngine {
 impl RouteEngine {
     /// Create a new RouteEngine with the given strategy and backends.
     pub fn new(strategy: RouteStrategy, backends: Vec<Arc<BackendConfig>>) -> Self {
-        Self {
-            strategy,
-            backends,
-        }
+        Self { strategy, backends }
     }
 
     /// Find the backend that handles the given tool.
@@ -103,10 +94,8 @@ impl RouteEngine {
                 if !rules.is_empty() {
                     for rule in rules {
                         if self.match_pattern(tool_name, &rule.tool_pattern) {
-                            if let Some(backend) = self
-                                .backends
-                                .iter()
-                                .find(|b| b.name == rule.backend)
+                            if let Some(backend) =
+                                self.backends.iter().find(|b| b.name == rule.backend)
                             {
                                 return Some(RouteTarget {
                                     backend: Arc::clone(backend),
@@ -234,10 +223,7 @@ mod tests {
 
     #[test]
     fn test_pattern_match() {
-        let engine = RouteEngine::new(
-            RouteStrategy::RuleBased { rules: vec![] },
-            vec![],
-        );
+        let engine = RouteEngine::new(RouteStrategy::RuleBased { rules: vec![] }, vec![]);
         assert!(engine.match_pattern("weather_city", "weather_*"));
         assert!(engine.match_pattern("anything", "*"));
         assert!(!engine.match_pattern("weather_city", "echo_*"));

@@ -86,3 +86,20 @@ fn challenge(state: &AppState, status: StatusCode, error: &str) -> Response {
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
+
+#[derive(Clone)]
+pub struct AdmissionPermit(pub std::sync::Arc<tokio::sync::OwnedSemaphorePermit>);
+pub async fn admission_layer(
+    State(state): State<AppState>,
+    mut req: Request,
+    next: Next,
+) -> Response {
+    if req.method() == axum::http::Method::POST && req.uri().path().starts_with("/mcp") {
+        let Ok(permit) = state.inflight.clone().try_acquire_owned() else {
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        };
+        req.extensions_mut()
+            .insert(AdmissionPermit(std::sync::Arc::new(permit)));
+    }
+    next.run(req).await
+}

@@ -15,9 +15,6 @@ pub async fn handle(
     principal: Option<axum::Extension<crate::auth::oauth::Principal>>,
     body: Bytes,
 ) -> Response {
-    let Ok(_permit) = state.inflight.clone().try_acquire_owned() else {
-        return StatusCode::TOO_MANY_REQUESTS.into_response();
-    };
     if let Some(version) = headers.get("MCP-Protocol-Version") {
         if !version
             .to_str()

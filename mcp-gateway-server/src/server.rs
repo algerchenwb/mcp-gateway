@@ -91,6 +91,10 @@ pub fn build_router(state: AppState) -> Router {
         .layer(middleware::from_fn(logging::logging_layer))
         .layer(middleware::from_fn_with_state(
             state.clone(),
+            auth::admission_layer,
+        ))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
             auth::auth_layer,
         ))
         .layer(middleware::from_fn_with_state(

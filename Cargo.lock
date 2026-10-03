@@ -1491,6 +1491,7 @@ dependencies = [
 name = "mcp-gateway-stdio"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "clap",
  "mcp-gateway-core",
  "mcp-gateway-sdk",

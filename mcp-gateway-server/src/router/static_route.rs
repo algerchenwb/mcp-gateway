@@ -5,8 +5,8 @@
 
 use std::sync::Arc;
 
-use crate::config::{BackendConfig, GatewayConfig};
 use super::engine::{RouteEngine, RouteStrategy};
+use crate::config::{BackendConfig, GatewayConfig};
 
 /// Build a RouteEngine from the gateway configuration.
 pub fn build_engine(config: &GatewayConfig) -> RouteEngine {

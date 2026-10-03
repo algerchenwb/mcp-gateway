@@ -230,8 +230,10 @@ async fn legacy_sse_executes_calls_and_rejects_another_identity() {
 }
 #[tokio::test]
 async fn gateway_can_use_legacy_sse_backend() {
-    let mut upstream_config = GatewayConfig::default();
-    upstream_config.backends = vec![stdio_config()];
+    let upstream_config = GatewayConfig {
+        backends: vec![stdio_config()],
+        ..Default::default()
+    };
     let upstream_state = AppState::new(upstream_config);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/mcp/sse", listener.local_addr().unwrap());
