@@ -32,17 +32,26 @@ struct ToolPool {
     next: AtomicU64,
 }
 impl ToolPool {
-    fn select(&self) -> ToolEntry {
-        let total: u64 = self
+    fn select(&self) -> McpResult<ToolEntry> {
+        let available: Vec<_> = self
             .entries
+            .iter()
+            .filter(|entry| entry.client.available())
+            .collect();
+        let total: u64 = available
             .iter()
             .map(|entry| u64::from(entry.backend.weight))
             .sum();
+        if total == 0 {
+            return Err(McpError::CircuitBreakerOpen(
+                self.entries[0].tool.name.clone(),
+            ));
+        }
         let mut ticket = self.next.fetch_add(1, Ordering::Relaxed) % total;
-        for entry in &self.entries {
+        for entry in available {
             let weight = u64::from(entry.backend.weight);
             if ticket < weight {
-                return entry.clone();
+                return Ok(entry.clone());
             }
             ticket -= weight;
         }
@@ -200,10 +209,11 @@ impl Generation {
     pub async fn resolve(&self, name: &str) -> McpResult<Option<ToolEntry>> {
         self.refresh().await?;
         let catalog = self.catalog.lock().await;
-        Ok(catalog
+        catalog
             .as_ref()
             .and_then(|(_, entries)| entries.get(name))
-            .map(ToolPool::select))
+            .map(ToolPool::select)
+            .transpose()
     }
     pub async fn shutdown(&self) {
         for (_, client) in &self.backends {

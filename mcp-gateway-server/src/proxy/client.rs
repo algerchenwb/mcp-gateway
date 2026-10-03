@@ -41,11 +41,17 @@ pub struct BackendClient {
     connection: RwLock<Option<Arc<Connection>>>,
     initialize: Mutex<()>,
     permits: Semaphore,
+    circuit: Arc<super::circuit::Circuit>,
 }
 impl BackendClient {
     pub fn new(config: Arc<BackendConfig>) -> Self {
         Self {
             permits: Semaphore::new(config.max_connections),
+            circuit: super::circuit::Circuit::new(
+                config.name.clone(),
+                config.failure_threshold,
+                Duration::from_millis(config.cooldown_ms),
+            ),
             config,
             connection: RwLock::new(None),
             initialize: Mutex::new(()),
@@ -72,14 +78,27 @@ impl BackendClient {
             _ => Err(McpError::Transport("unexpected backend response".into())),
         }
     }
+    pub fn available(&self) -> bool {
+        self.circuit.available()
+    }
     pub async fn send(&self, message: JsonRpcMessage) -> McpResult<JsonRpcMessage> {
+        let mut health = if matches!(&message, JsonRpcMessage::Request(request) if request.method == "tools/call")
+        {
+            Some(self.circuit.begin()?)
+        } else {
+            None
+        };
+        let mut attempted = false;
+        let mut used_connection = None;
         let result = tokio::time::timeout(Duration::from_millis(self.config.timeout_ms), async {
             let _permit = self
                 .permits
                 .acquire()
                 .await
                 .map_err(|_| McpError::Transport("backend is shutting down".into()))?;
+            attempted = true;
             let connection = self.ensure_connection().await?;
+            used_connection = Some(connection.clone());
             let mut cancellation = BackendCancellation {
                 connection: connection.clone(),
                 id: match &message {
@@ -94,19 +113,37 @@ impl BackendClient {
             response?.ok_or_else(|| McpError::Transport("expected backend response".into()))
         })
         .await;
+        if attempted {
+            if let Some(health) = &mut health {
+                health.finish(!matches!(&result, Ok(Ok(_)) | Ok(Err(McpError::Rpc(_)))));
+            }
+        }
         match result {
             Ok(Ok(message)) => Ok(message),
             Ok(Err(error)) => {
                 // Never automatically replay a tool call after a transport failure.
                 if !matches!(error, McpError::Rpc(_)) {
-                    self.invalidate().await;
+                    if let Some(connection) = &used_connection {
+                        self.invalidate_connection(connection).await;
+                    }
                 }
                 Err(error)
             }
             Err(_) => {
-                self.invalidate().await;
+                if let Some(connection) = &used_connection {
+                    self.invalidate_connection(connection).await;
+                }
                 Err(McpError::BackendTimeout(self.config.name.clone()))
             }
+        }
+    }
+    async fn invalidate_connection(&self, failed: &Arc<Connection>) {
+        let mut current = self.connection.write().await;
+        if current
+            .as_ref()
+            .is_some_and(|connection| Arc::ptr_eq(connection, failed))
+        {
+            current.take();
         }
     }
     async fn invalidate(&self) {
@@ -555,5 +592,49 @@ impl SseConnection {
 impl Drop for SseConnection {
     fn drop(&mut self) {
         self.reader.abort();
+    }
+}
+
+#[cfg(test)]
+mod circuit_admission_tests {
+    use super::*;
+    #[tokio::test]
+    async fn stale_failure_does_not_discard_a_replacement_connection() {
+        let client = BackendClient::new(Arc::new(BackendConfig::default()));
+        let failed = Arc::new(Connection::Http(HttpTransport::new(
+            "http://localhost/old",
+            None,
+        )));
+        let replacement = Arc::new(Connection::Http(HttpTransport::new(
+            "http://localhost/new",
+            None,
+        )));
+        *client.connection.write().await = Some(replacement.clone());
+        client.invalidate_connection(&failed).await;
+        assert!(Arc::ptr_eq(
+            client.connection.read().await.as_ref().unwrap(),
+            &replacement
+        ));
+        client.invalidate_connection(&replacement).await;
+        assert!(client.connection.read().await.is_none());
+    }
+    #[tokio::test]
+    async fn waiting_for_backend_capacity_does_not_trip_the_circuit() {
+        let client = BackendClient::new(Arc::new(BackendConfig {
+            name: "queued".into(),
+            endpoint: Some("http://127.0.0.1:9/mcp".into()),
+            max_connections: 1,
+            timeout_ms: 10,
+            failure_threshold: 1,
+            ..Default::default()
+        }));
+        let permit = client.permits.acquire().await.unwrap();
+        assert!(matches!(
+            client.request("tools/call", None).await,
+            Err(McpError::BackendTimeout(_))
+        ));
+        assert!(client.available());
+        drop(permit);
+        client.shutdown().await;
     }
 }

@@ -139,3 +139,20 @@ fn invalid_replica_configuration_is_rejected() {
     };
     assert!(config.validate().is_err());
 }
+
+#[tokio::test]
+async fn repeated_transport_failures_remove_a_replica_from_subsequent_routing() {
+    let (state, tasks, counts) = fixture(false, true, true).await;
+    for id in 0..18 {
+        let result = mcp_gateway_server::handlers::json_rpc::process_message(state.clone(), serde_json::from_value(serde_json::json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{"name":"echo","arguments":{}}})).unwrap()).await.unwrap().0;
+        if id > 8 {
+            assert!(result.get("result").is_some(), "{result}");
+        }
+    }
+    assert_eq!(counts[0].load(Ordering::SeqCst), 3);
+    assert_eq!(counts[1].load(Ordering::SeqCst), 15);
+    state.backends.shutdown().await;
+    for task in tasks {
+        task.abort();
+    }
+}

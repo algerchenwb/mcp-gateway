@@ -114,6 +114,10 @@ pub struct BackendConfig {
     /// Positive weight for deterministic weighted round-robin routing.
     #[serde(default = "default_weight")]
     pub weight: u32,
+    #[serde(default = "default_failure_threshold")]
+    pub failure_threshold: u32,
+    #[serde(default = "default_cooldown")]
+    pub cooldown_ms: u64,
 }
 
 fn default_transport() -> String {
@@ -128,6 +132,12 @@ fn default_max_connections() -> usize {
     10
 }
 
+fn default_failure_threshold() -> u32 {
+    3
+}
+fn default_cooldown() -> u64 {
+    30000
+}
 fn default_weight() -> u32 {
     1
 }
@@ -156,6 +166,8 @@ impl Default for BackendConfig {
             max_connections: default_max_connections(),
             replica_group: None,
             weight: default_weight(),
+            failure_threshold: default_failure_threshold(),
+            cooldown_ms: default_cooldown(),
         }
     }
 }
@@ -430,6 +442,12 @@ impl GatewayConfig {
                 {
                     errors.push(format!("backends[{i}]: invalid backend header"));
                 }
+            }
+            if backend.failure_threshold == 0
+                || backend.cooldown_ms == 0
+                || backend.cooldown_ms > 86400000
+            {
+                errors.push(format!("backends[{i}]: failure_threshold must be positive and cooldown_ms in 1..=86400000"));
             }
             if backend.weight == 0
                 || backend
