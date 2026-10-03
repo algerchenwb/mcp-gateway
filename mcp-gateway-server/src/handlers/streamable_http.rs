@@ -72,16 +72,11 @@ fn protocol_error(code: i32, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{cache::l1::L1Cache, config::GatewayConfig, server::build_router};
+    use crate::{config::GatewayConfig, server::build_router};
     use axum::{body::Body, http::Request};
-    use std::{sync::Arc, time::Duration};
     use tower::ServiceExt;
     async fn post(body: &str) -> Response {
-        let state = AppState {
-            config: Arc::new(GatewayConfig::default()),
-            cache: Arc::new(L1Cache::new(10, Duration::from_secs(10))),
-            metrics: Arc::default(),
-        };
+        let state = AppState::new(GatewayConfig::default());
         build_router(state)
             .oneshot(
                 Request::builder()

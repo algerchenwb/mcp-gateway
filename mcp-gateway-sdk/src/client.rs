@@ -89,7 +89,7 @@ impl GatewayClient {
     ) -> McpResult<ToolCallResult> {
         let params = serde_json::json!({
             "name": name,
-            "arguments": arguments.unwrap_or(serde_json::Value::Null),
+            "arguments": arguments.unwrap_or_else(||serde_json::json!({})),
         });
 
         let result = self.send_request("tools/call", Some(params)).await?;

@@ -68,6 +68,9 @@ pub struct BackendConfig {
     /// Environment variables for the command (for stdio transport).
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub env: std::collections::HashMap<String, String>,
+    /// Fixed backend credentials; inbound credentials are never forwarded.
+    #[serde(default)]
+    pub headers: std::collections::HashMap<String, String>,
     /// Tools this backend provides. The gateway routes tool calls to the
     /// first backend that lists the requested tool. If empty, all tools
     /// from this backend are available.
@@ -120,6 +123,7 @@ impl Default for BackendConfig {
             command: None,
             args: Vec::new(),
             env: std::collections::HashMap::new(),
+            headers: std::collections::HashMap::new(),
             tools: Vec::new(),
             cache_tools: Vec::new(),
             timeout_ms: default_timeout(),
@@ -308,6 +312,13 @@ impl GatewayConfig {
                     errors.push(format!(
                         "backends[{i}]: endpoint must be an HTTP(S) URL without userinfo"
                     ));
+                }
+            }
+            for (name, value) in &backend.headers {
+                if name.parse::<axum::http::HeaderName>().is_err()
+                    || value.parse::<axum::http::HeaderValue>().is_err()
+                {
+                    errors.push(format!("backends[{i}]: invalid backend header"));
                 }
             }
             for tool in &backend.tools {

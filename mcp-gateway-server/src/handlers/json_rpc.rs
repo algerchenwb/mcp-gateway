@@ -7,7 +7,6 @@ use axum::extract::State;
 use axum::Json;
 use serde_json::Value;
 
-use mcp_gateway_core::tool::Tool;
 use mcp_gateway_core::types::{
     error_codes, Implementation, InitializeRequest, InitializeResult, JsonRpcErrorResponse,
     JsonRpcMessage, JsonRpcRequest, JsonRpcResponse, RequestId, ServerCapabilities,
@@ -15,7 +14,6 @@ use mcp_gateway_core::types::{
 };
 
 use crate::proxy::forward;
-use crate::router::static_route::build_engine;
 use crate::server::AppState;
 
 /// Handle a JSON-RPC request at POST /mcp.
@@ -86,7 +84,7 @@ async fn handle_request(state: AppState, req: JsonRpcRequest, scope: &str) -> Js
 
     match method {
         "initialize" => handle_initialize(req.id, req.params),
-        "tools/list" => handle_tools_list(state, req.id),
+        "tools/list" => handle_tools_list(state, req.id).await,
         "tools/call" => handle_tools_call(state, req.id, req.params, scope).await,
         "ping" => handle_ping(req.id),
         _ => JsonRpcMessage::Error(JsonRpcErrorResponse::new(
@@ -173,26 +171,19 @@ fn handle_initialize(id: RequestId, params: Option<Value>) -> JsonRpcMessage {
 }
 
 /// Handle `tools/list` — list all tools from all configured backends.
-fn handle_tools_list(state: AppState, id: RequestId) -> JsonRpcMessage {
-    let engine = build_engine(&state.config);
-    let tools: Vec<Tool> = engine
-        .all_tools()
-        .into_iter()
-        .map(|(name, backend)| Tool {
-            name,
-            description: Some(format!("Tool from backend '{backend}'")),
-            extra: Default::default(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {}
-            }),
-        })
-        .collect();
-
-    JsonRpcMessage::Response(JsonRpcResponse::new(
-        id,
-        serde_json::json!({"tools": tools}),
-    ))
+async fn handle_tools_list(state: AppState, id: RequestId) -> JsonRpcMessage {
+    match state.backends.tools().await {
+        Ok(mut entries) => {
+            entries.sort_by(|a, b| a.tool.name.cmp(&b.tool.name));
+            let tools: Vec<_> = entries.into_iter().map(|entry| entry.tool).collect();
+            JsonRpcMessage::Response(JsonRpcResponse::new(id, serde_json::json!({"tools":tools})))
+        }
+        Err(error) => JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+            id,
+            error.to_error_code(),
+            error.to_string(),
+        )),
+    }
 }
 
 /// Handle `tools/call` — invoke a tool on a backend via the proxy layer.
@@ -213,26 +204,52 @@ async fn handle_tools_call(
         }
     };
 
-    let tool_name = params
+    let Some(tool_name) = params
         .get("name")
-        .and_then(|v| v.as_str())
-        .unwrap_or("unknown");
-
-    let arguments = params.get("arguments").cloned();
-
-    // Resolve the backend via route engine
-    let engine = build_engine(&state.config);
-    let target = match engine.resolve(tool_name) {
-        Some(t) => t,
-        None => {
-            tracing::warn!(tool = tool_name, "no backend found for tool");
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())
+    else {
+        return JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+            id,
+            error_codes::INVALID_PARAMS,
+            "tools/call requires a nonempty name",
+        ));
+    };
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    if !arguments.is_object() {
+        return JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+            id,
+            error_codes::INVALID_PARAMS,
+            "arguments must be an object",
+        ));
+    }
+    let target = match state.backends.resolve(tool_name).await {
+        Ok(Some(target)) => target,
+        Ok(None) => {
             return JsonRpcMessage::Error(JsonRpcErrorResponse::new(
                 id,
-                error_codes::METHOD_NOT_FOUND,
-                format!("no backend configured for tool: {tool_name}"),
-            ));
+                error_codes::INVALID_PARAMS,
+                format!("unknown tool: {tool_name}"),
+            ))
+        }
+        Err(error) => {
+            return JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                id,
+                error.to_error_code(),
+                error.to_string(),
+            ))
         }
     };
+    if !target.validator.is_valid(&arguments) {
+        return JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+            id,
+            error_codes::INVALID_PARAMS,
+            "arguments do not match the tool inputSchema",
+        ));
+    }
 
     // Record the tool call metric
     state.metrics.record_tool_call();
@@ -244,7 +261,7 @@ async fn handle_tools_call(
         None
     };
 
-    match forward::forward_tool_call(&target, tool_name, arguments, cache, scope).await {
+    match forward::forward_tool_call(&target, tool_name, Some(arguments), cache, scope).await {
         Ok(result) => JsonRpcMessage::Response(JsonRpcResponse::new(
             id,
             serde_json::to_value(result).unwrap_or_default(),
@@ -255,11 +272,19 @@ async fn handle_tools_call(
                 error = %e,
                 "tool call failed"
             );
-            JsonRpcMessage::Error(JsonRpcErrorResponse::new(
-                id,
-                e.to_error_code(),
-                e.to_string(),
-            ))
+            if let mcp_gateway_core::error::McpError::Rpc(detail) = e {
+                JsonRpcMessage::Error(JsonRpcErrorResponse {
+                    jsonrpc: "2.0".into(),
+                    id,
+                    error: detail,
+                })
+            } else {
+                JsonRpcMessage::Error(JsonRpcErrorResponse::new(
+                    id,
+                    e.to_error_code(),
+                    e.to_string(),
+                ))
+            }
         }
     }
 }
@@ -282,34 +307,6 @@ fn json_error_value(id: RequestId, code: i32, message: impl Into<String>) -> Val
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::l1::L1Cache;
-    use crate::config::{AuthConfig, BackendConfig, CacheConfig, GatewayConfig, GatewaySettings};
-    use std::sync::Arc;
-
-    fn test_state() -> AppState {
-        AppState {
-            config: Arc::new(GatewayConfig {
-                gateway: GatewaySettings {
-                    name: "test".into(),
-                    listen_addr: "127.0.0.1:0".into(),
-                    allowed_origins: vec![],
-                },
-                backends: vec![BackendConfig {
-                    name: "test-backend".into(),
-                    transport: "streamable-http".into(),
-                    endpoint: Some("http://localhost:9001/mcp".into()),
-                    tools: vec!["echo".into()],
-                    ..Default::default()
-                }],
-                auth: AuthConfig::default(),
-                cache: CacheConfig::default(),
-                ..Default::default()
-            }),
-            cache: Arc::new(L1Cache::new(100, std::time::Duration::from_secs(60))),
-            metrics: Arc::new(crate::middleware::metrics::Metrics::default()),
-        }
-    }
-
     #[test]
     fn test_initialize() {
         let result = handle_initialize(
@@ -327,22 +324,6 @@ mod tests {
                     serde_json::from_value(resp.result.unwrap()).unwrap();
                 assert_eq!(init_result.protocol_version, "2025-06-18");
                 assert!(init_result.capabilities.tools.is_some());
-            }
-            _ => panic!("expected response"),
-        }
-    }
-
-    #[test]
-    fn test_tools_list() {
-        let state = test_state();
-        let result = handle_tools_list(state, RequestId::Number(1));
-
-        match result {
-            JsonRpcMessage::Response(resp) => {
-                let obj = resp.result.unwrap();
-                let tools = obj["tools"].as_array().unwrap();
-                assert_eq!(tools.len(), 1);
-                assert_eq!(tools[0]["name"], "echo");
             }
             _ => panic!("expected response"),
         }

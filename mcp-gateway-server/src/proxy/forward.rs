@@ -5,15 +5,12 @@
 //! 2. Forwards the request to the backend via the appropriate transport
 //! 3. Stores the result in the cache
 
-use std::sync::Arc;
-
 use mcp_gateway_core::error::{McpError, McpResult};
 use mcp_gateway_core::tool::ToolCallResult;
 use mcp_gateway_core::types::{JsonRpcMessage, JsonRpcRequest, RequestId};
 
 use crate::cache::l1::L1Cache;
-use crate::proxy::client::BackendClient;
-use crate::router::engine::RouteTarget;
+use crate::proxy::registry::ToolEntry;
 
 /// Build a deterministic cache key from tool name and arguments.
 ///
@@ -58,13 +55,17 @@ fn canonical(value: &serde_json::Value) -> serde_json::Value {
 ///
 /// Returns the tool call result, checking the cache first.
 pub async fn forward_tool_call(
-    target: &RouteTarget,
+    target: &ToolEntry,
     tool_name: &str,
     arguments: Option<serde_json::Value>,
     cache: Option<&L1Cache>,
     scope: &str,
 ) -> McpResult<ToolCallResult> {
-    let args = arguments.unwrap_or(serde_json::Value::Null);
+    let args = arguments.unwrap_or_else(|| serde_json::json!({}));
+    let scope = format!(
+        "{scope}:{}",
+        serde_json::to_string(&target.tool).unwrap_or_default()
+    );
 
     let cache = cache.filter(|_| {
         target
@@ -76,7 +77,7 @@ pub async fn forward_tool_call(
 
     // 1. Check cache
     if let Some(cache) = cache {
-        let key = cache_key(&target.backend, scope, tool_name, &args);
+        let key = cache_key(&target.backend, &scope, tool_name, &args);
         if let Some(cached) = cache.get(&key).await {
             tracing::debug!(tool = tool_name, backend = target.backend.name, "cache hit");
             return Ok(cached);
@@ -96,7 +97,7 @@ pub async fn forward_tool_call(
     let message = JsonRpcMessage::Request(request);
 
     // 3. Send to backend
-    let client = BackendClient::new(Arc::clone(&target.backend));
+    let client = &target.client;
 
     tracing::info!(
         tool = tool_name,
@@ -136,10 +137,7 @@ pub async fn forward_tool_call(
             })?
         }
         JsonRpcMessage::Error(err) => {
-            return Err(McpError::BackendConnection(format!(
-                "backend returned error: {} (code: {})",
-                err.error.message, err.error.code
-            )));
+            return Err(McpError::Rpc(err.error));
         }
         _ => {
             return Err(McpError::BackendConnection(
@@ -150,7 +148,7 @@ pub async fn forward_tool_call(
 
     // 5. Store in cache
     if let Some(cache) = cache {
-        let key = cache_key(&target.backend, scope, tool_name, &args);
+        let key = cache_key(&target.backend, &scope, tool_name, &args);
         cache.set(&key, result.clone()).await;
         tracing::debug!(tool = tool_name, "cached result");
     }

@@ -14,6 +14,25 @@ pub struct AppState {
     pub config: Arc<GatewayConfig>,
     pub cache: Arc<L1Cache>,
     pub metrics: Arc<metrics::Metrics>,
+    pub backends: Arc<crate::proxy::registry::BackendRegistry>,
+}
+
+impl AppState {
+    pub fn new(config: GatewayConfig) -> Self {
+        let cache = Arc::new(L1Cache::with_limits(
+            config.cache.max_capacity,
+            config.cache.max_bytes,
+            config.cache.max_result_bytes,
+            std::time::Duration::from_secs(config.cache.ttl_seconds),
+        ));
+        let backends = Arc::new(crate::proxy::registry::BackendRegistry::new(&config));
+        Self {
+            config: Arc::new(config),
+            cache,
+            backends,
+            metrics: Arc::default(),
+        }
+    }
 }
 
 /// Build the axum router with all routes and middleware.
@@ -56,19 +75,7 @@ pub fn build_router(state: AppState) -> Router {
 pub async fn run(config: GatewayConfig) {
     let listen_addr = config.gateway.listen_addr.clone();
 
-    // Build L1 cache
-    let cache = Arc::new(L1Cache::with_limits(
-        config.cache.max_capacity,
-        config.cache.max_bytes,
-        config.cache.max_result_bytes,
-        std::time::Duration::from_secs(config.cache.ttl_seconds),
-    ));
-
-    let state = AppState {
-        config: Arc::new(config),
-        cache,
-        metrics: Arc::new(metrics::Metrics::default()),
-    };
+    let state = AppState::new(config);
 
     let app = build_router(state);
 
@@ -107,11 +114,7 @@ mod security_tests {
         config.auth.enabled = true;
         config.auth.api_keys = vec!["test-secret".into()];
         config.gateway.allowed_origins = vec!["https://trusted.example".into()];
-        build_router(AppState {
-            config: Arc::new(config),
-            cache: Arc::new(L1Cache::new(10, std::time::Duration::from_secs(10))),
-            metrics: Arc::default(),
-        })
+        build_router(AppState::new(config))
     }
     #[tokio::test]
     async fn every_mcp_entrypoint_requires_authentication() {
